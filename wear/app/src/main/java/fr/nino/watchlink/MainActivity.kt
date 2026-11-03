@@ -20,12 +20,18 @@ class MainActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var toggle: Button
 
-    private val permissions = arrayOf(
+    /** Sans ces permissions, la diffusion ne peut pas démarrer. */
+    private val requiredPermissions = arrayOf(
         Manifest.permission.BODY_SENSORS,
         Manifest.permission.BLUETOOTH_CONNECT,
         Manifest.permission.BLUETOOTH_ADVERTISE,
         Manifest.permission.POST_NOTIFICATIONS
     )
+
+    /** Permissions demandées une fois ; l'activité physique est facultative (compteur de pas). */
+    private val allPermissions = requiredPermissions + Manifest.permission.ACTIVITY_RECOGNITION
+
+    private var askedOnce = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,7 +58,7 @@ class MainActivity : Activity() {
         toggle = Button(this).apply {
             setOnClickListener { onToggle() }
         }
-        // Coupe la sonnerie "retrouver ma montre" lancée depuis l'iPhone
+        // Coupe la sonnerie ou la vibration "retrouver ma montre" lancée depuis l'iPhone
         val stopRing = Button(this).apply {
             text = "Couper la sonnerie"
             setOnClickListener {
@@ -94,13 +100,16 @@ class MainActivity : Activity() {
             statusText.text = "Arrêté"
             // `running` repasse à false dans onDestroy du service, on met le bouton à jour tout de suite
             toggle.text = "Démarrer"
-        } else if (hasAllPermissions()) {
+        } else if (!askedOnce && !hasAll(allPermissions)) {
+            askedOnce = true
+            requestPermissions(allPermissions, 1)
+        } else if (hasAll(requiredPermissions)) {
             setAutostart(true)
             startForegroundService(Intent(this, HeartRateService::class.java))
             toggle.text = "Arrêter"
             statusText.text = "Démarrage…"
         } else {
-            requestPermissions(permissions, 1)
+            statusText.text = "Permissions refusées"
         }
     }
 
@@ -113,14 +122,10 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        if (hasAllPermissions()) {
-            onToggle()
-        } else {
-            statusText.text = "Permissions refusées"
-        }
+        onToggle()
     }
 
-    private fun hasAllPermissions() = permissions.all {
+    private fun hasAll(list: Array<String>) = list.all {
         checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
     }
 

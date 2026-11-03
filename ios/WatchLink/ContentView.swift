@@ -9,6 +9,9 @@ struct ContentView: View {
             LiveView(manager: manager, history: manager.history)
                 .tabItem { Label("En direct", systemImage: "heart.fill") }
 
+            ActivityView(manager: manager, history: manager.history)
+                .tabItem { Label("Activité", systemImage: "figure.walk") }
+
             HistoryView(history: manager.history)
                 .tabItem { Label("Historique", systemImage: "chart.xyaxis.line") }
 

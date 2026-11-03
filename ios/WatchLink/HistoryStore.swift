@@ -1,6 +1,6 @@
 import Foundation
 
-/// Une mesure : `t` en secondes Unix, `b` en battements par minute (format compact pour le JSON).
+/// Une mesure : `t` en secondes Unix, `b` en battements par minute ou en pourcentage (format compact pour le JSON).
 struct Sample: Codable, Identifiable {
     let t: Int
     let b: Int
@@ -39,6 +39,12 @@ struct Session: Codable, Identifiable {
     var duration: TimeInterval { TimeInterval(end - start) }
 }
 
+struct DaySteps: Identifiable {
+    let date: Date
+    let steps: Int
+    var id: Date { date }
+}
+
 func formatDuration(_ seconds: TimeInterval) -> String {
     let total = Int(seconds)
     let h = total / 3600
@@ -48,21 +54,35 @@ func formatDuration(_ seconds: TimeInterval) -> String {
     return "\(total) s"
 }
 
-/// Garde la courbe en direct (1 point par seconde, 2 minutes) et l'historique des sessions
-/// (1 point toutes les 10 secondes, conservé 7 jours dans un fichier JSON).
+/// Garde la courbe en direct (1 point par seconde, 2 minutes), l'historique des sessions
+/// (1 point toutes les 10 secondes, 7 jours), les pas par jour et le journal de batterie.
+/// Tout est enregistré dans des fichiers JSON du dossier Documents de l'app.
 final class HistoryStore: ObservableObject {
     @Published private(set) var sessions: [Session] = []
     @Published private(set) var live: [Sample] = []
+    @Published private(set) var dailySteps: [String: Int] = [:]
+    @Published private(set) var batteryLog: [Sample] = []
 
     private var currentID: UUID?
     private var lastStored = 0
     private var lastSave = Date.distantPast
-    private let fileURL: URL
+    private let sessionsURL: URL
+    private let stepsURL: URL
+    private let batteryURL: URL
     private let retention: TimeInterval = 7 * 24 * 3600
+
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
 
     init() {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        fileURL = dir.appendingPathComponent("history.json")
+        sessionsURL = dir.appendingPathComponent("history.json")
+        stepsURL = dir.appendingPathComponent("steps.json")
+        batteryURL = dir.appendingPathComponent("battery.json")
         load()
     }
 
@@ -76,6 +96,8 @@ final class HistoryStore: ObservableObject {
         guard let i = currentIndex else { return nil }
         return Stats(sessions[i].samples)
     }
+
+    // MARK: - Rythme cardiaque
 
     func add(bpm: Int) {
         let now = Date()
@@ -122,27 +144,71 @@ final class HistoryStore: ObservableObject {
         save()
     }
 
-    func save() {
-        lastSave = Date()
-        prune()
-        do {
-            let data = try JSONEncoder().encode(sessions)
-            try data.write(to: fileURL, options: .atomic)
-        } catch {
-            // L'historique est un confort : on ne bloque pas l'app si l'écriture échoue
+    // MARK: - Pas
+
+    static func dayKey(_ date: Date = Date()) -> String {
+        dayFormatter.string(from: date)
+    }
+
+    func setSteps(_ n: Int) {
+        dailySteps[Self.dayKey()] = n
+    }
+
+    var todaySteps: Int {
+        dailySteps[Self.dayKey()] ?? 0
+    }
+
+    /// Les pas des 7 derniers jours, du plus ancien au plus récent.
+    func weekSteps() -> [DaySteps] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        return (0..<7).reversed().compactMap { offset in
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: today) else { return nil }
+            return DaySteps(date: day, steps: dailySteps[Self.dayKey(day)] ?? 0)
         }
     }
 
+    // MARK: - Batterie de la montre
+
+    func addBattery(_ level: Int) {
+        let t = Int(Date().timeIntervalSince1970)
+        // On ne note pas deux fois le même niveau à moins de 10 minutes d'écart
+        if let last = batteryLog.last, last.b == level, t - last.t < 600 { return }
+        batteryLog.append(Sample(t: t, b: level))
+    }
+
+    // MARK: - Fichiers
+
+    func save() {
+        lastSave = Date()
+        prune()
+        write(sessions, to: sessionsURL)
+        write(dailySteps, to: stepsURL)
+        write(batteryLog, to: batteryURL)
+    }
+
+    private func write<T: Encodable>(_ value: T, to url: URL) {
+        // L'historique est un confort : on ne bloque pas l'app si l'écriture échoue
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private func read<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(type, from: data)
+    }
+
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let stored = try? JSONDecoder().decode([Session].self, from: data) else { return }
-        sessions = stored
+        if let stored = read([Session].self, from: sessionsURL) { sessions = stored }
+        if let stored = read([String: Int].self, from: stepsURL) { dailySteps = stored }
+        if let stored = read([Sample].self, from: batteryURL) { batteryLog = stored }
         prune()
     }
 
     private func prune() {
         let cutoff = Int(Date().timeIntervalSince1970 - retention)
         sessions.removeAll { $0.end < cutoff && $0.id != currentID }
+        batteryLog.removeAll { $0.t < cutoff }
     }
 
     /// Écrit un fichier CSV temporaire à partager (Fichiers, Mail, tableur…).

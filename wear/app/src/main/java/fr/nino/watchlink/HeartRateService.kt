@@ -40,15 +40,16 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
+import java.time.LocalDate
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 
 /**
- * Service au premier plan : lit le capteur cardiaque de la montre et le diffuse
- * en Bluetooth Low Energy. Il expose trois services :
+ * Service au premier plan : lit les capteurs de la montre et les diffuse en Bluetooth Low Energy.
+ * Il expose trois services :
  *  - Heart Rate (0x180D) : les battements, lus nativement par l'iPhone
  *  - Battery (0x180F)    : le niveau de batterie de la montre
- *  - un service de commandes maison : sonnerie, seuils d'alerte, démarrage auto
+ *  - un service maison   : commandes (iPhone vers montre) et événements (montre vers iPhone, ex. les pas)
  *
  * Android ne laisse tourner un capteur en continu, écran éteint, que dans un
  * service au premier plan, d'où la notification permanente et le wake lock.
@@ -66,6 +67,11 @@ class HeartRateService : Service(), SensorEventListener {
         private const val KEY_ALERT_LOW = "alert_lo"
         private const val KEY_ALERT_HIGH = "alert_hi"
         private const val KEY_ALERT_VIBRATE = "alert_vibrate"
+        private const val KEY_HR_INTERVAL = "hr_interval"
+        private const val KEY_STEP_DAY = "step_day"
+        private const val KEY_STEP_BASE = "step_base"
+        private const val KEY_STEP_CARRY = "step_carry"
+        private const val KEY_STEP_LAST = "step_last"
 
         private fun std(short: String): UUID =
             UUID.fromString("0000$short-0000-1000-8000-00805f9b34fb")
@@ -76,15 +82,25 @@ class HeartRateService : Service(), SensorEventListener {
         val BATTERY_LEVEL: UUID = std("2a19")
         val CCCD: UUID = std("2902")
 
-        // Service de commandes maison (l'iPhone écrit dedans)
+        // Service maison : l'iPhone écrit des commandes, la montre envoie des événements
         val CTRL_SERVICE: UUID = UUID.fromString("9f2b0001-6c1d-4a57-8e3b-5d6a7c8e9f10")
         val CTRL_COMMAND: UUID = UUID.fromString("9f2b0002-6c1d-4a57-8e3b-5d6a7c8e9f10")
+        val CTRL_EVENT: UUID = UUID.fromString("9f2b0003-6c1d-4a57-8e3b-5d6a7c8e9f10")
 
         // Commandes : premier octet de l'écriture
-        private const val CMD_RING_START = 0x01
-        private const val CMD_RING_STOP = 0x02
+        private const val CMD_RING_START = 0x01 // sonnerie + vibration
+        private const val CMD_RING_STOP = 0x02 // coupe sonnerie et vibration
+        private const val CMD_VIBRATE_START = 0x03 // vibration seule
         private const val CMD_SET_ALERT = 0x10 // [0x10, bas, haut, flags] (0 = désactivé, flags bit0 = vibration)
         private const val CMD_SET_AUTOSTART = 0x30 // [0x30, 0 ou 1]
+        private const val CMD_SET_INTERVAL = 0x40 // [0x40, hi, lo] secondes entre deux mesures (0 = désactivée)
+
+        // Événements envoyés à l'iPhone : premier octet de la notification
+        private const val EVENT_STEPS = 0x01 // [0x01, pas du jour sur 4 octets, petit-boutiste]
+
+        /** Au-delà de ce délai (en secondes), on mesure par à-coups au lieu de en continu. */
+        private const val CONTINUOUS_MAX_SEC = 5
+        private const val MEASURE_TIMEOUT_MS = 40_000L
 
         @Volatile var running: Boolean = false
         /** Appelés depuis le service pour mettre à jour l'écran. */
@@ -98,15 +114,22 @@ class HeartRateService : Service(), SensorEventListener {
     private var gattServer: BluetoothGattServer? = null
     private var hrCharacteristic: BluetoothGattCharacteristic? = null
     private var batteryCharacteristic: BluetoothGattCharacteristic? = null
+    private var eventCharacteristic: BluetoothGattCharacteristic? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private val pendingServices = ArrayDeque<BluetoothGattService>()
     private val hrSubscribers = CopyOnWriteArraySet<BluetoothDevice>()
     private val batterySubscribers = CopyOnWriteArraySet<BluetoothDevice>()
+    private val eventSubscribers = CopyOnWriteArraySet<BluetoothDevice>()
     private var lastBpm = 0
     private var lastAlertAt = 0L
     private var wakeLock: PowerManager.WakeLock? = null
     private var player: MediaPlayer? = null
     private var savedAlarmVolume = -1
+
+    private var hrSensor: Sensor? = null
+    private var hrActive = false
+    private var stepsToday = 0
+    private var lastStepNotifyAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -126,7 +149,7 @@ class HeartRateService : Service(), SensorEventListener {
         if (!running) {
             running = true
             acquireWakeLock()
-            startSensor()
+            startSensors()
             startBle()
             handler.post(batteryRunnable)
         }
@@ -136,6 +159,8 @@ class HeartRateService : Service(), SensorEventListener {
     override fun onDestroy() {
         running = false
         handler.removeCallbacks(batteryRunnable)
+        handler.removeCallbacks(dutyRunnable)
+        handler.removeCallbacks(measureTimeoutRunnable)
         stopRing()
         sensorManager.unregisterListener(this)
         try {
@@ -151,6 +176,7 @@ class HeartRateService : Service(), SensorEventListener {
         gattServer = null
         hrSubscribers.clear()
         batterySubscribers.clear()
+        eventSubscribers.clear()
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         status("Arrêté")
@@ -187,31 +213,161 @@ class HeartRateService : Service(), SensorEventListener {
         }
     }
 
-    // --- Capteur cardiaque --------------------------------------------------------
+    // --- Capteurs -----------------------------------------------------------------
 
-    private fun startSensor() {
-        val sensor = sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)
-        if (sensor == null) {
+    private fun startSensors() {
+        hrSensor = sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)
+        if (hrSensor == null) {
             status("Pas de capteur cardiaque")
-            return
+        } else {
+            applyInterval()
         }
+        // Compteur de pas : nécessite la permission "activité physique", sans elle on continue sans les pas
+        val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+        if (stepSensor != null) {
+            try {
+                sensorManager.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_NORMAL)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "pas: permission refusée")
+            }
+        }
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        when (event.sensor.type) {
+            Sensor.TYPE_HEART_RATE -> onHeartRate(event)
+            Sensor.TYPE_STEP_COUNTER -> onStepCounter(event.values[0].toLong())
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    // --- Rythme cardiaque : mesure continue ou par à-coups ------------------------
+
+    private fun intervalSec(): Int =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_HR_INTERVAL, 1)
+
+    private val dutyRunnable = Runnable {
+        startHr()
+        handler.postDelayed(measureTimeoutRunnable, MEASURE_TIMEOUT_MS)
+    }
+
+    /** Si aucune mesure valide n'arrive (montre mal portée), on coupe le capteur et on réessaiera plus tard. */
+    private val measureTimeoutRunnable = Runnable {
+        stopHr()
+        handler.postDelayed(dutyRunnable, intervalSec() * 1000L)
+    }
+
+    private fun startHr() {
+        val sensor = hrSensor ?: return
+        if (hrActive) return
         try {
             sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+            hrActive = true
         } catch (e: SecurityException) {
             status("Permission capteurs refusée")
         }
     }
 
-    override fun onSensorChanged(event: SensorEvent) {
+    private fun stopHr() {
+        val sensor = hrSensor ?: return
+        if (!hrActive) return
+        sensorManager.unregisterListener(this, sensor)
+        hrActive = false
+    }
+
+    /** Applique le réglage d'intervalle : 0 = désactivé, 1 à 5 s = continu, au-delà = une mesure toutes les N secondes. */
+    private fun applyInterval() {
+        handler.removeCallbacks(dutyRunnable)
+        handler.removeCallbacks(measureTimeoutRunnable)
+        val seconds = intervalSec()
+        when {
+            seconds <= 0 -> {
+                stopHr()
+                status("Mesure cardiaque désactivée")
+            }
+            seconds <= CONTINUOUS_MAX_SEC -> startHr()
+            else -> {
+                startHr()
+                handler.postDelayed(measureTimeoutRunnable, MEASURE_TIMEOUT_MS)
+            }
+        }
+    }
+
+    private fun onHeartRate(event: SensorEvent) {
         val bpm = event.values.firstOrNull()?.toInt() ?: return
         if (bpm <= 0) return // 0 = pas de mesure valide (montre mal placée, capteur en démarrage)
         lastBpm = bpm
         onBpm?.invoke(bpm)
         notifyHeartRate(bpm)
         checkAlert(bpm)
+
+        val seconds = intervalSec()
+        if (seconds > CONTINUOUS_MAX_SEC) {
+            // Mesure par à-coups : une valeur suffit, on coupe le capteur jusqu'à la prochaine
+            handler.removeCallbacks(measureTimeoutRunnable)
+            stopHr()
+            handler.removeCallbacks(dutyRunnable)
+            handler.postDelayed(dutyRunnable, seconds * 1000L)
+        }
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    // --- Pas ----------------------------------------------------------------------
+
+    /**
+     * Le capteur donne le total de pas depuis le dernier redémarrage de la montre.
+     * On en déduit les pas du jour, en gardant le cumul quand la montre redémarre.
+     */
+    private fun onStepCounter(counter: Long) {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val today = LocalDate.now().toString()
+        var base = prefs.getLong(KEY_STEP_BASE, counter)
+        var carry = prefs.getLong(KEY_STEP_CARRY, 0)
+        val last = prefs.getLong(KEY_STEP_LAST, counter)
+
+        if (prefs.getString(KEY_STEP_DAY, null) != today) {
+            // Nouveau jour : on repart de zéro
+            base = counter
+            carry = 0
+        } else if (counter < last) {
+            // La montre a redémarré : le compteur est reparti de zéro, on garde ce qui était déjà compté
+            carry += last - base
+            base = counter
+        }
+        prefs.edit()
+            .putString(KEY_STEP_DAY, today)
+            .putLong(KEY_STEP_BASE, base)
+            .putLong(KEY_STEP_CARRY, carry)
+            .putLong(KEY_STEP_LAST, counter)
+            .apply()
+
+        stepsToday = (carry + counter - base).coerceAtLeast(0).toInt()
+
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastStepNotifyAt > 15_000) {
+            lastStepNotifyAt = now
+            notifySteps()
+        }
+    }
+
+    private fun notifySteps() {
+        val characteristic = eventCharacteristic ?: return
+        val n = stepsToday
+        val payload = byteArrayOf(
+            EVENT_STEPS.toByte(),
+            (n and 0xFF).toByte(),
+            ((n shr 8) and 0xFF).toByte(),
+            ((n shr 16) and 0xFF).toByte(),
+            ((n shr 24) and 0xFF).toByte()
+        )
+        for (device in eventSubscribers) {
+            try {
+                gattServer?.notifyCharacteristicChanged(device, characteristic, false, payload)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "notify pas: $e")
+            }
+        }
+    }
 
     // --- Alerte de rythme (vibration) ---------------------------------------------
 
@@ -238,7 +394,7 @@ class HeartRateService : Service(), SensorEventListener {
         }
     }
 
-    // --- Sonnerie pour retrouver la montre ---------------------------------------
+    // --- Sonnerie et vibration pour retrouver la montre ---------------------------
 
     private val stopRingRunnable = Runnable { stopRing() }
 
@@ -273,6 +429,15 @@ class HeartRateService : Service(), SensorEventListener {
             Log.e(TAG, "sonnerie: $e")
         }
         // Arrêt automatique au bout d'une minute
+        handler.removeCallbacks(stopRingRunnable)
+        handler.postDelayed(stopRingRunnable, 60_000)
+    }
+
+    /** Vibration seule, sans son. */
+    private fun startVibrateOnly() {
+        stopRing()
+        vibrate(longArrayOf(0, 600, 400), 0)
+        status("Vibration en cours")
         handler.removeCallbacks(stopRingRunnable)
         handler.postDelayed(stopRingRunnable, 60_000)
     }
@@ -375,6 +540,14 @@ class HeartRateService : Service(), SensorEventListener {
                 BluetoothGattCharacteristic.PERMISSION_WRITE
             )
             controlService.addCharacteristic(command)
+            val event = BluetoothGattCharacteristic(
+                CTRL_EVENT,
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                0
+            )
+            event.addDescriptor(cccd())
+            controlService.addCharacteristic(event)
+            eventCharacteristic = event
 
             // Android n'accepte qu'un addService à la fois : on les enchaîne
             // via onServiceAdded, puis on lance l'annonce quand le dernier est prêt.
@@ -443,6 +616,7 @@ class HeartRateService : Service(), SensorEventListener {
             if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 hrSubscribers.remove(device)
                 batterySubscribers.remove(device)
+                eventSubscribers.remove(device)
                 status("Déconnecté, en attente…")
             } else if (newState == BluetoothProfile.STATE_CONNECTED) {
                 status("iPhone connecté")
@@ -478,6 +652,14 @@ class HeartRateService : Service(), SensorEventListener {
                             batterySubscribers.remove(device)
                         }
                     }
+                    CTRL_EVENT -> {
+                        if (enabled) {
+                            eventSubscribers.add(device)
+                            handler.post { notifySteps() }
+                        } else {
+                            eventSubscribers.remove(device)
+                        }
+                    }
                 }
             }
             if (responseNeeded) respond(device, requestId, BluetoothGatt.GATT_SUCCESS, value)
@@ -492,6 +674,7 @@ class HeartRateService : Service(), SensorEventListener {
             val subscribed = when (descriptor.characteristic.uuid) {
                 HR_MEASUREMENT -> hrSubscribers.contains(device)
                 BATTERY_LEVEL -> batterySubscribers.contains(device)
+                CTRL_EVENT -> eventSubscribers.contains(device)
                 else -> false
             }
             val value = if (subscribed)
@@ -545,6 +728,7 @@ class HeartRateService : Service(), SensorEventListener {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         when (value.firstOrNull()?.toInt()) {
             CMD_RING_START -> startRing()
+            CMD_VIBRATE_START -> startVibrateOnly()
             CMD_RING_STOP -> {
                 stopRing()
                 status("iPhone connecté")
@@ -558,6 +742,13 @@ class HeartRateService : Service(), SensorEventListener {
             }
             CMD_SET_AUTOSTART -> if (value.size >= 2) {
                 prefs.edit().putBoolean(KEY_AUTOSTART, value[1].toInt() != 0).apply()
+            }
+            CMD_SET_INTERVAL -> if (value.size >= 3) {
+                val seconds = ((value[1].toInt() and 0xFF) shl 8) or (value[2].toInt() and 0xFF)
+                if (seconds != prefs.getInt(KEY_HR_INTERVAL, 1)) {
+                    prefs.edit().putInt(KEY_HR_INTERVAL, seconds).apply()
+                    applyInterval()
+                }
             }
         }
     }

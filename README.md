@@ -7,6 +7,20 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Nouveautés de la version 0.3.0
+
+- Fréquence de la mesure cardiaque réglable depuis l'iPhone : en continu, toutes les 10 s / 30 s / 1 min / 5 min / 15 min, ou désactivée (pour économiser la batterie).
+- Pas du jour comptés par la montre, et distance estimée à partir de ta taille (réglable). Onglet **Activité** avec les pas des 7 derniers jours.
+- Graphique de la batterie de la montre sur 48 h.
+- Boutons pour faire sonner la montre, la faire vibrer seulement, ou annuler.
+- Icône pour les deux apps.
+
+Pour que la montre compte les pas, accorde aussi cette permission si l'app ne la demande pas :
+
+```
+adb shell pm grant fr.nino.watchlink android.permission.ACTIVITY_RECOGNITION
+```
+
 ## Fonctions (version 0.2.0)
 
 App iPhone, trois onglets :

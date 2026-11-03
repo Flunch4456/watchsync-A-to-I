@@ -10,12 +10,20 @@ enum SettingsKey {
     static let alertVibrate = "alertVibrate"
     static let alertPhone = "alertPhone"
     static let autostart = "autostart"
+    static let hrInterval = "hrInterval"
+    static let heightCm = "heightCm"
+}
+
+/// Ce que la montre est en train de faire pour qu'on la retrouve.
+enum WatchAlert {
+    case none, ring, vibrate
 }
 
 /// Client Bluetooth Low Energy : se connecte à la montre, qui joue le rôle de serveur.
 ///  - Heart Rate (0x180D) : battements par notification
 ///  - Battery (0x180F) : niveau de batterie
-///  - service de commandes maison : sonnerie, seuils d'alerte, démarrage auto
+///  - service maison : commandes (sonnerie, vibration, seuils, intervalle de mesure)
+///    et événements (pas du jour)
 final class HeartRateManager: NSObject, ObservableObject {
 
     struct Found: Identifiable {
@@ -29,7 +37,8 @@ final class HeartRateManager: NSObject, ObservableObject {
     @Published var found: [Found] = []
     @Published var connectedName: String?
     @Published var battery: Int?
-    @Published var ringing = false
+    @Published var steps: Int?
+    @Published var watchAlert: WatchAlert = .none
     @Published var controlAvailable = false
 
     let history = HistoryStore()
@@ -40,12 +49,13 @@ final class HeartRateManager: NSObject, ObservableObject {
     private static let batteryLevel = CBUUID(string: "2A19")
     private static let controlService = CBUUID(string: "9F2B0001-6C1D-4A57-8E3B-5D6A7C8E9F10")
     private static let controlCommand = CBUUID(string: "9F2B0002-6C1D-4A57-8E3B-5D6A7C8E9F10")
+    private static let controlEvent = CBUUID(string: "9F2B0003-6C1D-4A57-8E3B-5D6A7C8E9F10")
     private static let savedKey = "savedPeripheralID"
 
     private var central: CBCentralManager!
     private var current: CBPeripheral?
     private var commandChar: CBCharacteristic?
-    private var ringReset: DispatchWorkItem?
+    private var alertReset: DispatchWorkItem?
     private var lastPhoneAlert = Date.distantPast
 
     override init() {
@@ -56,7 +66,9 @@ final class HeartRateManager: NSObject, ObservableObject {
             SettingsKey.alertHigh: 130,
             SettingsKey.alertVibrate: true,
             SettingsKey.alertPhone: true,
-            SettingsKey.autostart: true
+            SettingsKey.autostart: true,
+            SettingsKey.hrInterval: 1,
+            SettingsKey.heightCm: 175
         ])
         UNUserNotificationCenter.current().delegate = self
         // La clé de restauration permet à iOS de relancer l'app en arrière-plan
@@ -114,7 +126,7 @@ final class HeartRateManager: NSObject, ObservableObject {
         connectedName = nil
         controlAvailable = false
         commandChar = nil
-        ringing = false
+        watchAlert = .none
         history.endSession()
     }
 
@@ -125,7 +137,7 @@ final class HeartRateManager: NSObject, ObservableObject {
         p.writeValue(Data(bytes), for: c, type: .withResponse)
     }
 
-    /// Envoie les réglages à la montre (seuils, vibration, démarrage auto).
+    /// Envoie les réglages à la montre (seuils, vibration, démarrage auto, intervalle de mesure).
     func sendConfig() {
         let d = UserDefaults.standard
         let enabled = d.bool(forKey: SettingsKey.alertEnabled)
@@ -134,18 +146,34 @@ final class HeartRateManager: NSObject, ObservableObject {
         let flags: UInt8 = d.bool(forKey: SettingsKey.alertVibrate) ? 1 : 0
         write([0x10, UInt8(clamping: low), UInt8(clamping: high), flags])
         write([0x30, d.bool(forKey: SettingsKey.autostart) ? 1 : 0])
+
+        let seconds = UInt16(clamping: d.integer(forKey: SettingsKey.hrInterval))
+        write([0x40, UInt8(seconds >> 8), UInt8(seconds & 0xFF)])
     }
 
-    func toggleRing() {
-        ringing.toggle()
-        write([ringing ? 0x01 : 0x02])
-        ringReset?.cancel()
-        if ringing {
-            // La montre coupe la sonnerie seule au bout d'une minute
-            let item = DispatchWorkItem { [weak self] in self?.ringing = false }
-            ringReset = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: item)
-        }
+    func startRing() {
+        write([0x01])
+        beginAlert(.ring)
+    }
+
+    func startVibrate() {
+        write([0x03])
+        beginAlert(.vibrate)
+    }
+
+    func stopAlert() {
+        write([0x02])
+        alertReset?.cancel()
+        watchAlert = .none
+    }
+
+    private func beginAlert(_ kind: WatchAlert) {
+        watchAlert = kind
+        alertReset?.cancel()
+        // La montre coupe seule au bout d'une minute
+        let item = DispatchWorkItem { [weak self] in self?.watchAlert = .none }
+        alertReset = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: item)
     }
 
     // MARK: - Alertes sur l'iPhone
@@ -284,6 +312,8 @@ extension HeartRateManager: CBPeripheralDelegate {
                 commandChar = c
                 controlAvailable = true
                 sendConfig()
+            case Self.controlEvent:
+                peripheral.setNotifyValue(true, for: c)
             default:
                 break
             }
@@ -295,25 +325,43 @@ extension HeartRateManager: CBPeripheralDelegate {
                     error: Error?) {
         guard let data = characteristic.value else { return }
 
-        if characteristic.uuid == Self.batteryLevel {
-            if let level = data.first { battery = Int(level) }
-            return
-        }
+        switch characteristic.uuid {
+        case Self.batteryLevel:
+            if let level = data.first {
+                battery = Int(level)
+                history.addBattery(Int(level))
+            }
 
-        guard characteristic.uuid == Self.hrMeasurement, data.count >= 2 else { return }
-        let flags = data[0]
-        // Bit 0 des flags : 0 = BPM sur 8 bits, 1 = BPM sur 16 bits
-        let value: Int
-        if flags & 0x01 == 0 {
-            value = Int(data[1])
-        } else if data.count >= 3 {
-            value = Int(data[1]) | (Int(data[2]) << 8)
-        } else {
-            return
+        case Self.controlEvent:
+            // Événement 0x01 : pas du jour sur 4 octets, petit-boutiste
+            if data.count >= 5, data[0] == 0x01 {
+                var n = 0
+                for i in 0..<4 {
+                    n |= Int(data[data.startIndex + 1 + i]) << (8 * i)
+                }
+                steps = n
+                history.setSteps(n)
+            }
+
+        case Self.hrMeasurement:
+            guard data.count >= 2 else { return }
+            let flags = data[0]
+            // Bit 0 des flags : 0 = BPM sur 8 bits, 1 = BPM sur 16 bits
+            let value: Int
+            if flags & 0x01 == 0 {
+                value = Int(data[1])
+            } else if data.count >= 3 {
+                value = Int(data[1]) | (Int(data[2]) << 8)
+            } else {
+                return
+            }
+            bpm = value
+            status = "Mesure en direct"
+            history.add(bpm: value)
+            checkAlert(value)
+
+        default:
+            break
         }
-        bpm = value
-        status = "Mesure en direct"
-        history.add(bpm: value)
-        checkAlert(value)
     }
 }

@@ -9,10 +9,28 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.alertVibrate) private var alertVibrate = true
     @AppStorage(SettingsKey.alertPhone) private var alertPhone = true
     @AppStorage(SettingsKey.autostart) private var autostart = true
+    @AppStorage(SettingsKey.hrInterval) private var hrInterval = 1
+    @AppStorage(SettingsKey.heightCm) private var heightCm = 175
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Picker("Fréquence", selection: $hrInterval) {
+                        Text("En continu (chaque seconde)").tag(1)
+                        Text("Toutes les 10 secondes").tag(10)
+                        Text("Toutes les 30 secondes").tag(30)
+                        Text("Toutes les minutes").tag(60)
+                        Text("Toutes les 5 minutes").tag(300)
+                        Text("Toutes les 15 minutes").tag(900)
+                        Text("Désactivée").tag(0)
+                    }
+                } header: {
+                    Text("Mesure cardiaque")
+                } footer: {
+                    Text("Le capteur est ce qui consomme le plus de batterie. Plus l'intervalle est long, plus la montre tient longtemps. Entre deux mesures, la dernière valeur reste affichée.")
+                }
+
                 Section {
                     Toggle("Activer les alertes", isOn: $alertEnabled)
                     Stepper("Seuil bas : \(alertLow) bpm", value: $alertLow, in: 30...120)
@@ -29,7 +47,11 @@ struct SettingsView: View {
                     Text("Une alerte par minute au maximum quand le rythme sort de la plage. Les réglages sont envoyés à la montre dès qu'elle est connectée.")
                 }
 
-                Section("Montre") {
+                Section("Activité") {
+                    Stepper("Taille : \(heightCm) cm", value: $heightCm, in: 100...230)
+                }
+
+                Section {
                     Toggle("Démarrage automatique", isOn: $autostart)
 
                     if let level = manager.battery {
@@ -37,16 +59,33 @@ struct SettingsView: View {
                     }
 
                     Button {
-                        manager.toggleRing()
+                        manager.startRing()
                     } label: {
-                        Label(manager.ringing ? "Arrêter la sonnerie" : "Faire sonner la montre",
-                              systemImage: manager.ringing ? "bell.slash.fill" : "bell.and.waves.left.and.right.fill")
+                        Label("Faire sonner la montre", systemImage: "bell.and.waves.left.and.right.fill")
                     }
                     .disabled(!manager.controlAvailable)
+
+                    Button {
+                        manager.startVibrate()
+                    } label: {
+                        Label("Faire vibrer la montre", systemImage: "waveform")
+                    }
+                    .disabled(!manager.controlAvailable)
+
+                    Button(role: .destructive) {
+                        manager.stopAlert()
+                    } label: {
+                        Label("Annuler la sonnerie / vibration", systemImage: "bell.slash.fill")
+                    }
+                    .disabled(!manager.controlAvailable || manager.watchAlert == .none)
+                } header: {
+                    Text("Montre")
+                } footer: {
+                    Text("La sonnerie et la vibration s'arrêtent seules au bout d'une minute.")
                 }
 
                 Section {
-                    Text("L'affichage des notifications de l'iPhone sur la montre arrive à l'étape suivante. Le réglage pour l'activer ou le désactiver sera ici.")
+                    Text("L'affichage des notifications de l'iPhone sur la montre arrive dans un prochain lot. Le réglage pour l'activer ou le désactiver sera ici.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } header: {
@@ -71,6 +110,7 @@ struct SettingsView: View {
             .onChange(of: alertVibrate) { _ in manager.sendConfig() }
             .onChange(of: alertPhone) { _ in manager.sendConfig() }
             .onChange(of: autostart) { _ in manager.sendConfig() }
+            .onChange(of: hrInterval) { _ in manager.sendConfig() }
         }
     }
 }
