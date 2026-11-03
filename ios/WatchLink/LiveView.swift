@@ -4,6 +4,7 @@ import Charts
 struct LiveView: View {
     @ObservedObject var manager: HeartRateManager
     @ObservedObject var history: HistoryStore
+    @State private var code = ""
 
     var body: some View {
         ScrollView {
@@ -51,6 +52,22 @@ struct LiveView: View {
             }
             .font(.subheadline)
 
+            if manager.needsCode {
+                codeSection
+            }
+
+            if manager.authenticated && !manager.worn {
+                Label("Montre retirée : pas de mesure cardiaque", systemImage: "applewatch.slash")
+                    .font(.subheadline)
+                    .foregroundStyle(.orange)
+            }
+
+            if manager.syncing {
+                Label("Récupération des mesures de la montre…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             if let stats = history.currentStats {
                 HStack {
                     statBox("Min", stats.low)
@@ -76,6 +93,40 @@ struct LiveView: View {
                 }
             }
         }
+    }
+
+    private var codeSection: some View {
+        VStack(spacing: 10) {
+            Text("Première liaison")
+                .font(.headline)
+            Text("Sur la montre, ouvre WatchLink puis touche « Lier l'iPhone ». Saisis ici le code à 6 chiffres affiché.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            TextField("000000", text: $code)
+                .keyboardType(.numberPad)
+                .multilineTextAlignment(.center)
+                .font(.system(size: 32, weight: .bold, design: .monospaced))
+                .textFieldStyle(.roundedBorder)
+                .onChange(of: code) { value in
+                    let digits = String(value.filter { $0.isNumber }.prefix(6))
+                    if digits != value { code = digits }
+                }
+            if let error = manager.codeError {
+                Text(error)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            }
+            Button("Lier") {
+                manager.submitCode(code)
+                code = ""
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(code.count != 6)
+        }
+        .padding()
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func statBox(_ title: String, _ value: Int) -> some View {

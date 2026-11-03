@@ -11,6 +11,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.autostart) private var autostart = true
     @AppStorage(SettingsKey.hrInterval) private var hrInterval = 1
     @AppStorage(SettingsKey.heightCm) private var heightCm = 175
+    @AppStorage(SettingsKey.offWristNotify) private var offWristNotify = true
 
     var body: some View {
         NavigationStack {
@@ -45,6 +46,14 @@ struct SettingsView: View {
                     Text("Alertes de rythme")
                 } footer: {
                     Text("Une alerte par minute au maximum quand le rythme sort de la plage. Les réglages sont envoyés à la montre dès qu'elle est connectée.")
+                }
+
+                Section {
+                    Toggle("Notifier si la montre est retirée", isOn: $offWristNotify)
+                } header: {
+                    Text("Port de la montre")
+                } footer: {
+                    Text("Quand la montre n'est plus au poignet, elle arrête la mesure cardiaque et l'iPhone te prévient.")
                 }
 
                 Section("Activité") {
@@ -85,7 +94,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Text("L'affichage des notifications de l'iPhone sur la montre arrive dans un prochain lot. Le réglage pour l'activer ou le désactiver sera ici.")
+                    Text("L'affichage des notifications de l'iPhone sur la montre arrive dans un prochain lot (iOS impose un mécanisme à part). Le réglage pour l'activer ou le désactiver sera ici.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } header: {

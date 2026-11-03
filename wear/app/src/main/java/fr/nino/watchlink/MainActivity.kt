@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
@@ -19,6 +20,7 @@ class MainActivity : Activity() {
     private lateinit var bpmText: TextView
     private lateinit var statusText: TextView
     private lateinit var toggle: Button
+    private lateinit var codeText: TextView
 
     /** Sans ces permissions, la diffusion ne peut pas démarrer. */
     private val requiredPermissions = arrayOf(
@@ -69,10 +71,30 @@ class MainActivity : Activity() {
             }
         }
 
+        // Liaison avec l'iPhone : un code à 6 chiffres s'affiche ici, à saisir sur l'iPhone
+        codeText = TextView(this).apply {
+            textSize = 30f
+            setTextColor(Color.YELLOW)
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        val pair = serviceButton("Lier l'iPhone", HeartRateService.ACTION_PAIR)
+        val forget = serviceButton("Oublier la liaison", HeartRateService.ACTION_FORGET_PAIRING)
+        // Depuis la montre : faire sonner ou vibrer l'iPhone
+        val phoneRing = phoneButton("Faire sonner l'iPhone", 1)
+        val phoneVibrate = phoneButton("Faire vibrer l'iPhone", 2)
+        val phoneCancel = phoneButton("Annuler (iPhone)", 0)
+
         column.addView(bpmText, wrap())
         column.addView(statusText, wrap())
         column.addView(toggle, wrap())
+        column.addView(pair, wrap())
+        column.addView(codeText, wrap())
+        column.addView(phoneRing, wrap())
+        column.addView(phoneVibrate, wrap())
+        column.addView(phoneCancel, wrap())
         column.addView(stopRing, wrap())
+        column.addView(forget, wrap())
 
         setContentView(ScrollView(this).apply { addView(column) })
         refreshButton()
@@ -82,12 +104,15 @@ class MainActivity : Activity() {
         super.onResume()
         HeartRateService.onBpm = { bpm -> runOnUiThread { bpmText.text = "$bpm" } }
         HeartRateService.onStatus = { s -> runOnUiThread { statusText.text = s } }
+        HeartRateService.onPairingCode = { c -> runOnUiThread { showCode(c) } }
+        showCode(HeartRateService.pairingCode)
         refreshButton()
     }
 
     override fun onPause() {
         HeartRateService.onBpm = null
         HeartRateService.onStatus = null
+        HeartRateService.onPairingCode = null
         super.onPause()
     }
 
@@ -131,6 +156,41 @@ class MainActivity : Activity() {
 
     private fun refreshButton() {
         toggle.text = if (HeartRateService.running) "Arrêter" else "Démarrer"
+    }
+
+    private fun showCode(code: String?) {
+        if (code == null) {
+            codeText.visibility = View.GONE
+        } else {
+            codeText.text = code.substring(0, 3) + " " + code.substring(3)
+            codeText.visibility = View.VISIBLE
+        }
+    }
+
+    /** Bouton qui envoie une action au service ; il le démarre si besoin. */
+    private fun serviceButton(label: String, action: String) = Button(this).apply {
+        text = label
+        setOnClickListener {
+            if (!HeartRateService.running) {
+                if (!hasAll(requiredPermissions)) {
+                    statusText.text = "Appuie d'abord sur Démarrer"
+                    return@setOnClickListener
+                }
+                startForegroundService(Intent(this@MainActivity, HeartRateService::class.java))
+            }
+            startService(Intent(this@MainActivity, HeartRateService::class.java).setAction(action))
+        }
+    }
+
+    private fun phoneButton(label: String, kind: Int) = Button(this).apply {
+        text = label
+        setOnClickListener {
+            startService(
+                Intent(this@MainActivity, HeartRateService::class.java)
+                    .setAction(HeartRateService.ACTION_PHONE_ALERT)
+                    .putExtra(HeartRateService.EXTRA_KIND, kind)
+            )
+        }
     }
 
     private fun wrap() = LinearLayout.LayoutParams(

@@ -7,6 +7,17 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Nouveautés de la version 0.4.0
+
+- **Liaison par code** : sur la montre, touche « Lier l'iPhone » → un code à 6 chiffres s'affiche (valable 2 min). Tape-le sur l'iPhone. Ensuite la montre ne parle qu'à cet iPhone. Pour changer d'iPhone, « Oublier la liaison » sur la montre.
+- **Montre retirée** : la mesure cardiaque est coupée et l'iPhone envoie une notification « Montre retirée » (réglable).
+- **Mesures hors connexion** : sans iPhone, la montre garde rythme, batterie et pas 7 jours et les envoie à la reconnexion.
+- **Depuis la montre** : boutons pour faire sonner / vibrer / annuler l'iPhone. Écran allumé : son + vibration. Écran éteint : iOS limite aux notifications sonores répétées pendant 1 minute.
+- Onglet **Santé** : sommeil estimé (approximatif, d'après le rythme cardiaque la nuit) et rythme au repos.
+- Limite : Samsung Health ne donne pas son sommeil à une app tierce sur la montre ; l'estimation est donc la nôtre.
+
+Retour arrière : branche `stable-v0.3.0`.
+
 ## Nouveautés de la version 0.3.0
 
 - Fréquence de la mesure cardiaque réglable depuis l'iPhone : en continu, toutes les 10 s / 30 s / 1 min / 5 min / 15 min, ou désactivée (pour économiser la batterie).

@@ -13,6 +13,7 @@ import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -39,9 +40,12 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Base64
 import android.util.Log
 import java.time.LocalDate
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.CopyOnWriteArraySet
 
 /**
@@ -49,8 +53,9 @@ import java.util.concurrent.CopyOnWriteArraySet
  * Il expose trois services :
  *  - Heart Rate (0x180D) : les battements, lus nativement par l'iPhone
  *  - Battery (0x180F)    : le niveau de batterie de la montre
- *  - un service maison   : commandes (iPhone vers montre) et événements (montre vers iPhone, ex. les pas)
+ *  - un service maison   : liaison par code, commandes, événements, synchronisation du journal
  *
+ * Aucun iPhone ne reçoit de données tant qu'il ne s'est pas lié avec le code affiché sur la montre.
  * Android ne laisse tourner un capteur en continu, écran éteint, que dans un
  * service au premier plan, d'où la notification permanente et le wake lock.
  */
@@ -62,6 +67,11 @@ class HeartRateService : Service(), SensorEventListener {
         private const val NOTIF_ID = 1
 
         const val ACTION_STOP_RING = "fr.nino.watchlink.STOP_RING"
+        const val ACTION_PAIR = "fr.nino.watchlink.PAIR"
+        const val ACTION_FORGET_PAIRING = "fr.nino.watchlink.FORGET_PAIRING"
+        const val ACTION_PHONE_ALERT = "fr.nino.watchlink.PHONE_ALERT"
+        const val EXTRA_KIND = "kind"
+
         const val PREFS = "watchlink"
         const val KEY_AUTOSTART = "autostart"
         private const val KEY_ALERT_LOW = "alert_lo"
@@ -72,6 +82,7 @@ class HeartRateService : Service(), SensorEventListener {
         private const val KEY_STEP_BASE = "step_base"
         private const val KEY_STEP_CARRY = "step_carry"
         private const val KEY_STEP_LAST = "step_last"
+        private const val KEY_LTK = "ltk"
 
         private fun std(short: String): UUID =
             UUID.fromString("0000$short-0000-1000-8000-00805f9b34fb")
@@ -82,44 +93,84 @@ class HeartRateService : Service(), SensorEventListener {
         val BATTERY_LEVEL: UUID = std("2a19")
         val CCCD: UUID = std("2902")
 
-        // Service maison : l'iPhone écrit des commandes, la montre envoie des événements
+        // Service maison
         val CTRL_SERVICE: UUID = UUID.fromString("9f2b0001-6c1d-4a57-8e3b-5d6a7c8e9f10")
         val CTRL_COMMAND: UUID = UUID.fromString("9f2b0002-6c1d-4a57-8e3b-5d6a7c8e9f10")
         val CTRL_EVENT: UUID = UUID.fromString("9f2b0003-6c1d-4a57-8e3b-5d6a7c8e9f10")
+        val CTRL_SYNC: UUID = UUID.fromString("9f2b0004-6c1d-4a57-8e3b-5d6a7c8e9f10")
+        val CTRL_AUTH: UUID = UUID.fromString("9f2b0005-6c1d-4a57-8e3b-5d6a7c8e9f10")
 
-        // Commandes : premier octet de l'écriture
+        // Commandes (iPhone vers montre) : premier octet de l'écriture
         private const val CMD_RING_START = 0x01 // sonnerie + vibration
         private const val CMD_RING_STOP = 0x02 // coupe sonnerie et vibration
         private const val CMD_VIBRATE_START = 0x03 // vibration seule
         private const val CMD_SET_ALERT = 0x10 // [0x10, bas, haut, flags] (0 = désactivé, flags bit0 = vibration)
         private const val CMD_SET_AUTOSTART = 0x30 // [0x30, 0 ou 1]
         private const val CMD_SET_INTERVAL = 0x40 // [0x40, hi, lo] secondes entre deux mesures (0 = désactivée)
+        private const val CMD_SYNC_REQUEST = 0x50 // [0x50, 4 octets] envoie tout ce qui est plus récent (secondes)
 
-        // Événements envoyés à l'iPhone : premier octet de la notification
-        private const val EVENT_STEPS = 0x01 // [0x01, pas du jour sur 4 octets, petit-boutiste]
+        // Événements (montre vers iPhone) : premier octet de la notification
+        private const val EVENT_STEPS = 0x01 // [0x01, pas du jour sur 4 octets]
+        private const val EVENT_WORN = 0x02 // [0x02, 1 = portée, 0 = retirée]
+        private const val EVENT_PHONE_ALERT = 0x03 // [0x03, 1 = sonner, 2 = vibrer, 0 = annuler]
+
+        // Synchronisation : types de paquets
+        private const val SYNC_HEART_RATE = 0x01
+        private const val SYNC_BATTERY = 0x02
+        private const val SYNC_STEPS = 0x03
+        private const val SYNC_END = 0xFF
+
+        // Liaison : réponses
+        private const val AUTH_READ_UNPAIRED = 0x10
+        private const val AUTH_READ_PAIRED = 0x11
+        private const val AUTH_DENIED = 0x20
+        private const val AUTH_OK = 0x21
+        private const val AUTH_PAIRED = 0x22
+        private const val PAIRING_DURATION_MS = 120_000L
+        private const val PAIRING_MAX_ATTEMPTS = 5
 
         /** Au-delà de ce délai (en secondes), on mesure par à-coups au lieu de en continu. */
         private const val CONTINUOUS_MAX_SEC = 5
         private const val MEASURE_TIMEOUT_MS = 40_000L
 
         @Volatile var running: Boolean = false
+        /** Code de liaison affiché sur la montre, null quand aucune liaison n'est en cours. */
+        @Volatile var pairingCode: String? = null
         /** Appelés depuis le service pour mettre à jour l'écran. */
         @Volatile var onBpm: ((Int) -> Unit)? = null
         @Volatile var onStatus: ((String) -> Unit)? = null
+        @Volatile var onPairingCode: ((String?) -> Unit)? = null
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var sensorManager: SensorManager
     private lateinit var btManager: BluetoothManager
+    private lateinit var sampleLog: SampleLog
     private var gattServer: BluetoothGattServer? = null
     private var hrCharacteristic: BluetoothGattCharacteristic? = null
     private var batteryCharacteristic: BluetoothGattCharacteristic? = null
     private var eventCharacteristic: BluetoothGattCharacteristic? = null
+    private var syncCharacteristic: BluetoothGattCharacteristic? = null
+    private var authCharacteristic: BluetoothGattCharacteristic? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private val pendingServices = ArrayDeque<BluetoothGattService>()
+
     private val hrSubscribers = CopyOnWriteArraySet<BluetoothDevice>()
     private val batterySubscribers = CopyOnWriteArraySet<BluetoothDevice>()
     private val eventSubscribers = CopyOnWriteArraySet<BluetoothDevice>()
+
+    // Liaison
+    private val authorized = CopyOnWriteArraySet<BluetoothDevice>()
+    private val authNonces = ConcurrentHashMap<BluetoothDevice, ByteArray>()
+    private var pairingExpiresAt = 0L
+    private var pairingAttempts = 0
+
+    // Synchronisation du journal
+    private val syncQueue = ConcurrentLinkedDeque<ByteArray>()
+    private var syncDevice: BluetoothDevice? = null
+    private var syncInFlight = false
+    private var currentMtu = 23
+
     private var lastBpm = 0
     private var lastAlertAt = 0L
     private var wakeLock: PowerManager.WakeLock? = null
@@ -128,8 +179,16 @@ class HeartRateService : Service(), SensorEventListener {
 
     private var hrSensor: Sensor? = null
     private var hrActive = false
+    private var onBody = true
     private var stepsToday = 0
     private var lastStepNotifyAt = 0L
+
+    // Journal : dernières écritures
+    private var lastLoggedHr = 0L
+    private var lastLoggedBatteryAt = 0L
+    private var lastLoggedBattery = -1
+    private var lastLoggedStepsAt = 0L
+    private var lastLoggedSteps = -1
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -137,18 +196,35 @@ class HeartRateService : Service(), SensorEventListener {
         super.onCreate()
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        sampleLog = SampleLog(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP_RING) {
-            stopRing()
-            if (!running) stopSelf()
-            return START_STICKY
+        when (intent?.action) {
+            ACTION_STOP_RING -> {
+                stopRing()
+                if (!running) stopSelf()
+                return START_STICKY
+            }
+            ACTION_PAIR -> {
+                if (running) startPairing() else stopSelf()
+                return START_STICKY
+            }
+            ACTION_FORGET_PAIRING -> {
+                forgetPairing()
+                if (!running) stopSelf()
+                return START_STICKY
+            }
+            ACTION_PHONE_ALERT -> {
+                if (running) sendPhoneAlert(intent.getIntExtra(EXTRA_KIND, 0)) else stopSelf()
+                return START_STICKY
+            }
         }
         startInForeground()
         if (!running) {
             running = true
             acquireWakeLock()
+            sampleLog.prune(System.currentTimeMillis() / 1000)
             startSensors()
             startBle()
             handler.post(batteryRunnable)
@@ -158,10 +234,9 @@ class HeartRateService : Service(), SensorEventListener {
 
     override fun onDestroy() {
         running = false
-        handler.removeCallbacks(batteryRunnable)
-        handler.removeCallbacks(dutyRunnable)
-        handler.removeCallbacks(measureTimeoutRunnable)
+        handler.removeCallbacksAndMessages(null)
         stopRing()
+        endPairing()
         sensorManager.unregisterListener(this)
         try {
             advertiser?.stopAdvertising(advertiseCallback)
@@ -177,6 +252,10 @@ class HeartRateService : Service(), SensorEventListener {
         hrSubscribers.clear()
         batterySubscribers.clear()
         eventSubscribers.clear()
+        authorized.clear()
+        authNonces.clear()
+        syncQueue.clear()
+        syncDevice = null
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         status("Arrêté")
@@ -217,11 +296,23 @@ class HeartRateService : Service(), SensorEventListener {
 
     private fun startSensors() {
         hrSensor = sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)
+
+        // Détection "montre au poignet" : quand elle est retirée, on coupe la mesure cardiaque
+        val offBody = sensorManager.getDefaultSensor(Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT)
+        if (offBody != null) {
+            try {
+                sensorManager.registerListener(this, offBody, SensorManager.SENSOR_DELAY_NORMAL)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "détection du port: permission refusée")
+            }
+        }
+
         if (hrSensor == null) {
             status("Pas de capteur cardiaque")
         } else {
             applyInterval()
         }
+
         // Compteur de pas : nécessite la permission "activité physique", sans elle on continue sans les pas
         val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
         if (stepSensor != null) {
@@ -237,10 +328,33 @@ class HeartRateService : Service(), SensorEventListener {
         when (event.sensor.type) {
             Sensor.TYPE_HEART_RATE -> onHeartRate(event)
             Sensor.TYPE_STEP_COUNTER -> onStepCounter(event.values[0].toLong())
+            Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT -> onOffBody(event.values[0] >= 0.5f)
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    // --- Montre portée ou retirée -------------------------------------------------
+
+    private fun onOffBody(worn: Boolean) {
+        if (worn == onBody) return
+        onBody = worn
+        notifyWorn()
+        if (worn) {
+            status("Montre portée")
+            applyInterval()
+        } else {
+            // Pas de mesure cardiaque tant que la montre n'est pas au poignet
+            handler.removeCallbacks(dutyRunnable)
+            handler.removeCallbacks(measureTimeoutRunnable)
+            stopHr()
+            status("Montre retirée : mesure en pause")
+        }
+    }
+
+    private fun notifyWorn() {
+        sendEvent(byteArrayOf(EVENT_WORN.toByte(), if (onBody) 1 else 0))
+    }
 
     // --- Rythme cardiaque : mesure continue ou par à-coups ------------------------
 
@@ -248,19 +362,21 @@ class HeartRateService : Service(), SensorEventListener {
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_HR_INTERVAL, 1)
 
     private val dutyRunnable: Runnable = Runnable {
-        startHr()
-        handler.postDelayed(measureTimeoutRunnable, MEASURE_TIMEOUT_MS)
+        if (onBody) {
+            startHr()
+            handler.postDelayed(measureTimeoutRunnable, MEASURE_TIMEOUT_MS)
+        }
     }
 
     /** Si aucune mesure valide n'arrive (montre mal portée), on coupe le capteur et on réessaiera plus tard. */
     private val measureTimeoutRunnable: Runnable = Runnable {
         stopHr()
-        handler.postDelayed(dutyRunnable, intervalSec() * 1000L)
+        if (onBody) handler.postDelayed(dutyRunnable, intervalSec() * 1000L)
     }
 
     private fun startHr() {
         val sensor = hrSensor ?: return
-        if (hrActive) return
+        if (hrActive || !onBody) return
         try {
             sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
             hrActive = true
@@ -280,6 +396,10 @@ class HeartRateService : Service(), SensorEventListener {
     private fun applyInterval() {
         handler.removeCallbacks(dutyRunnable)
         handler.removeCallbacks(measureTimeoutRunnable)
+        if (!onBody) {
+            stopHr()
+            return
+        }
         val seconds = intervalSec()
         when {
             seconds <= 0 -> {
@@ -295,12 +415,16 @@ class HeartRateService : Service(), SensorEventListener {
     }
 
     private fun onHeartRate(event: SensorEvent) {
+        if (!onBody) return
+        // Pas de contact avec la peau : la valeur n'a aucun sens
+        if (event.accuracy == SensorManager.SENSOR_STATUS_NO_CONTACT) return
         val bpm = event.values.firstOrNull()?.toInt() ?: return
-        if (bpm <= 0) return // 0 = pas de mesure valide (montre mal placée, capteur en démarrage)
+        if (bpm <= 0) return // 0 = pas de mesure valide (capteur en démarrage)
         lastBpm = bpm
         onBpm?.invoke(bpm)
         notifyHeartRate(bpm)
         checkAlert(bpm)
+        logHeartRate(bpm)
 
         val seconds = intervalSec()
         if (seconds > CONTINUOUS_MAX_SEC) {
@@ -309,6 +433,34 @@ class HeartRateService : Service(), SensorEventListener {
             stopHr()
             handler.removeCallbacks(dutyRunnable)
             handler.postDelayed(dutyRunnable, seconds * 1000L)
+        }
+    }
+
+    // --- Journal hors connexion ---------------------------------------------------
+
+    private fun logHeartRate(bpm: Int) {
+        val now = System.currentTimeMillis() / 1000
+        if (now - lastLoggedHr >= 10) {
+            lastLoggedHr = now
+            sampleLog.appendHeartRate(now, bpm)
+        }
+    }
+
+    private fun logBattery(percent: Int) {
+        val now = System.currentTimeMillis() / 1000
+        if (percent != lastLoggedBattery || now - lastLoggedBatteryAt >= 600) {
+            lastLoggedBattery = percent
+            lastLoggedBatteryAt = now
+            sampleLog.appendBattery(now, percent)
+        }
+    }
+
+    private fun logSteps(steps: Int) {
+        val now = System.currentTimeMillis() / 1000
+        if (steps != lastLoggedSteps && now - lastLoggedStepsAt >= 300) {
+            lastLoggedSteps = steps
+            lastLoggedStepsAt = now
+            sampleLog.appendSteps(LocalDate.now().toEpochDay(), steps)
         }
     }
 
@@ -342,6 +494,7 @@ class HeartRateService : Service(), SensorEventListener {
             .apply()
 
         stepsToday = (carry + counter - base).coerceAtLeast(0).toInt()
+        logSteps(stepsToday)
 
         val now = SystemClock.elapsedRealtime()
         if (now - lastStepNotifyAt > 15_000) {
@@ -351,22 +504,7 @@ class HeartRateService : Service(), SensorEventListener {
     }
 
     private fun notifySteps() {
-        val characteristic = eventCharacteristic ?: return
-        val n = stepsToday
-        val payload = byteArrayOf(
-            EVENT_STEPS.toByte(),
-            (n and 0xFF).toByte(),
-            ((n shr 8) and 0xFF).toByte(),
-            ((n shr 16) and 0xFF).toByte(),
-            ((n shr 24) and 0xFF).toByte()
-        )
-        for (device in eventSubscribers) {
-            try {
-                gattServer?.notifyCharacteristicChanged(device, characteristic, false, payload)
-            } catch (e: SecurityException) {
-                Log.w(TAG, "notify pas: $e")
-            }
-        }
+        sendEvent(byteArrayOf(EVENT_STEPS.toByte()) + le32(stepsToday.toLong()))
     }
 
     // --- Alerte de rythme (vibration) ---------------------------------------------
@@ -396,7 +534,7 @@ class HeartRateService : Service(), SensorEventListener {
 
     // --- Sonnerie et vibration pour retrouver la montre ---------------------------
 
-    private val stopRingRunnable = Runnable { stopRing() }
+    private val stopRingRunnable: Runnable = Runnable { stopRing() }
 
     private fun startRing() {
         stopRing()
@@ -469,6 +607,22 @@ class HeartRateService : Service(), SensorEventListener {
         }
     }
 
+    /** Depuis la montre : fait sonner (1), vibrer (2) ou arrête (0) l'iPhone. */
+    private fun sendPhoneAlert(kind: Int) {
+        if (eventSubscribers.isEmpty()) {
+            status("iPhone non connecté")
+            return
+        }
+        sendEvent(byteArrayOf(EVENT_PHONE_ALERT.toByte(), kind.toByte()))
+        status(
+            when (kind) {
+                1 -> "iPhone : sonnerie demandée"
+                2 -> "iPhone : vibration demandée"
+                else -> "iPhone : alerte annulée"
+            }
+        )
+    }
+
     // --- Batterie -----------------------------------------------------------------
 
     private fun batteryPercent(): Int {
@@ -476,8 +630,9 @@ class HeartRateService : Service(), SensorEventListener {
         return bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).coerceIn(0, 100)
     }
 
-    private val batteryRunnable = object : Runnable {
+    private val batteryRunnable: Runnable = object : Runnable {
         override fun run() {
+            logBattery(batteryPercent())
             notifyBattery()
             handler.postDelayed(this, 60_000)
         }
@@ -485,6 +640,7 @@ class HeartRateService : Service(), SensorEventListener {
 
     private fun notifyBattery() {
         val characteristic = batteryCharacteristic ?: return
+        if (syncActive()) return
         val value = byteArrayOf(batteryPercent().toByte())
         for (device in batterySubscribers) {
             try {
@@ -492,6 +648,184 @@ class HeartRateService : Service(), SensorEventListener {
             } catch (e: SecurityException) {
                 Log.w(TAG, "notify batterie: $e")
             }
+        }
+    }
+
+    // --- Liaison par code ---------------------------------------------------------
+
+    private fun loadLtk(): ByteArray? =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_LTK, null)
+            ?.let { Base64.decode(it, Base64.NO_WRAP) }
+
+    private fun saveLtk(key: ByteArray) {
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_LTK, Base64.encodeToString(key, Base64.NO_WRAP))
+            .apply()
+    }
+
+    private val endPairingRunnable: Runnable = Runnable { endPairing() }
+
+    /** Génère un code à 6 chiffres, affiché sur la montre et valable 2 minutes. */
+    private fun startPairing() {
+        val code = Crypto.sixDigitCode()
+        pairingCode = code
+        pairingAttempts = 0
+        pairingExpiresAt = SystemClock.elapsedRealtime() + PAIRING_DURATION_MS
+        onPairingCode?.invoke(code)
+        status("Liaison : saisis le code sur l'iPhone")
+        handler.removeCallbacks(endPairingRunnable)
+        handler.postDelayed(endPairingRunnable, PAIRING_DURATION_MS)
+    }
+
+    private fun endPairing() {
+        handler.removeCallbacks(endPairingRunnable)
+        pairingCode = null
+        onPairingCode?.invoke(null)
+    }
+
+    private fun forgetPairing() {
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_LTK).apply()
+        authorized.clear()
+        hrSubscribers.clear()
+        batterySubscribers.clear()
+        eventSubscribers.clear()
+        status("Liaison effacée")
+    }
+
+    private fun notifyAuth(device: BluetoothDevice, payload: ByteArray) {
+        val characteristic = authCharacteristic ?: return
+        try {
+            gattServer?.notifyCharacteristicChanged(device, characteristic, false, payload)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "notify liaison: $e")
+        }
+    }
+
+    /**
+     * Écriture de l'iPhone sur la caractéristique de liaison :
+     *  [0x01, preuve] : l'iPhone se connaît déjà, il prouve qu'il a la clé
+     *  [0x02, preuve] : l'iPhone envoie le code saisi, sous forme d'une preuve (le code ne circule pas)
+     * La montre répond par une notification : DENIED, OK, ou PAIRED suivie de la clé chiffrée.
+     */
+    private fun handleAuth(device: BluetoothDevice, value: ByteArray) {
+        val denied = byteArrayOf(AUTH_DENIED.toByte())
+        val nonce = authNonces[device]
+        if (nonce == null || value.size < 17) {
+            notifyAuth(device, denied)
+            return
+        }
+        val proof = value.copyOfRange(1, 17)
+
+        when (value[0].toInt()) {
+            0x01 -> {
+                val ltk = loadLtk()
+                if (ltk != null && Crypto.constantTimeEquals(proof, Crypto.hmac16(ltk, nonce))) {
+                    authorized.add(device)
+                    authNonces.remove(device)
+                    notifyAuth(device, byteArrayOf(AUTH_OK.toByte()))
+                    status("iPhone lié et connecté")
+                } else {
+                    notifyAuth(device, denied)
+                }
+            }
+            0x02 -> {
+                val code = pairingCode
+                val valid = code != null && SystemClock.elapsedRealtime() < pairingExpiresAt
+                if (code != null && valid) {
+                    val codeKey = Crypto.sha256(code.toByteArray(Charsets.UTF_8))
+                    if (Crypto.constantTimeEquals(proof, Crypto.hmac16(codeKey, nonce))) {
+                        // Code correct : on crée la clé, et on la renvoie chiffrée avec le code
+                        val ltk = Crypto.randomBytes(16)
+                        saveLtk(ltk)
+                        val stream = Crypto.hmac16(codeKey, nonce + "enc".toByteArray(Charsets.UTF_8))
+                        authorized.add(device)
+                        authNonces.remove(device)
+                        endPairing()
+                        notifyAuth(device, byteArrayOf(AUTH_PAIRED.toByte()) + Crypto.xor(ltk, stream))
+                        status("iPhone lié")
+                        return
+                    }
+                    pairingAttempts++
+                    if (pairingAttempts >= PAIRING_MAX_ATTEMPTS) endPairing()
+                }
+                notifyAuth(device, denied)
+            }
+            else -> notifyAuth(device, denied)
+        }
+    }
+
+    // --- Synchronisation du journal -----------------------------------------------
+
+    private fun le32(v: Long): ByteArray = byteArrayOf(
+        (v and 0xFF).toByte(),
+        ((v shr 8) and 0xFF).toByte(),
+        ((v shr 16) and 0xFF).toByte(),
+        ((v shr 24) and 0xFF).toByte()
+    )
+
+    private fun syncActive(): Boolean = syncDevice != null && !syncQueue.isEmpty()
+
+    /** Découpe les enregistrements en paquets qui tiennent dans une notification. */
+    private fun enqueueBatches(type: Int, records: List<ByteArray>, recordSize: Int) {
+        val capacity = (currentMtu - 3 - 1).coerceIn(recordSize, 200)
+        val perPacket = (capacity / recordSize).coerceAtLeast(1)
+        var i = 0
+        while (i < records.size) {
+            val chunk = records.subList(i, minOf(i + perPacket, records.size))
+            val out = ByteArray(1 + chunk.size * recordSize)
+            out[0] = type.toByte()
+            var pos = 1
+            for (record in chunk) {
+                System.arraycopy(record, 0, out, pos, recordSize)
+                pos += recordSize
+            }
+            syncQueue.addLast(out)
+            i += perPacket
+        }
+    }
+
+    /** L'iPhone demande tout ce qui est plus récent que `since` (secondes). */
+    private fun startSync(device: BluetoothDevice, since: Long) {
+        syncQueue.clear()
+        syncInFlight = false
+        syncDevice = device
+        val snapshot = sampleLog.readSince(since)
+        enqueueBatches(
+            SYNC_HEART_RATE,
+            snapshot.heartRate.map { le32(it.first) + byteArrayOf(it.second.coerceIn(0, 255).toByte()) },
+            5
+        )
+        enqueueBatches(
+            SYNC_BATTERY,
+            snapshot.battery.map { le32(it.first) + byteArrayOf(it.second.coerceIn(0, 100).toByte()) },
+            5
+        )
+        enqueueBatches(
+            SYNC_STEPS,
+            snapshot.steps.map { le32(it.first) + le32(it.second.toLong()) },
+            8
+        )
+        syncQueue.addLast(byteArrayOf(SYNC_END.toByte()))
+        pumpSync()
+    }
+
+    /** Une seule notification à la fois : on attend onNotificationSent avant la suivante. */
+    private fun pumpSync() {
+        val device = syncDevice ?: return
+        val characteristic = syncCharacteristic ?: return
+        if (syncInFlight) return
+        val packet = syncQueue.pollFirst() ?: return
+        try {
+            val result: Int? = gattServer?.notifyCharacteristicChanged(device, characteristic, false, packet)
+            if (result == BluetoothStatusCodes.SUCCESS) {
+                syncInFlight = true
+            } else {
+                // Occupé (une autre notification part) : on remet le paquet en tête et on réessaie
+                syncQueue.addFirst(packet)
+                handler.postDelayed({ pumpSync() }, 50)
+            }
+        } catch (e: SecurityException) {
+            syncQueue.clear()
         }
     }
 
@@ -540,6 +874,7 @@ class HeartRateService : Service(), SensorEventListener {
                 BluetoothGattCharacteristic.PERMISSION_WRITE
             )
             controlService.addCharacteristic(command)
+
             val event = BluetoothGattCharacteristic(
                 CTRL_EVENT,
                 BluetoothGattCharacteristic.PROPERTY_NOTIFY,
@@ -548,6 +883,26 @@ class HeartRateService : Service(), SensorEventListener {
             event.addDescriptor(cccd())
             controlService.addCharacteristic(event)
             eventCharacteristic = event
+
+            val sync = BluetoothGattCharacteristic(
+                CTRL_SYNC,
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                0
+            )
+            sync.addDescriptor(cccd())
+            controlService.addCharacteristic(sync)
+            syncCharacteristic = sync
+
+            val auth = BluetoothGattCharacteristic(
+                CTRL_AUTH,
+                BluetoothGattCharacteristic.PROPERTY_READ or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+            auth.addDescriptor(cccd())
+            controlService.addCharacteristic(auth)
+            authCharacteristic = auth
 
             // Android n'accepte qu'un addService à la fois : on les enchaîne
             // via onServiceAdded, puis on lance l'annonce quand le dernier est prêt.
@@ -612,11 +967,29 @@ class HeartRateService : Service(), SensorEventListener {
             handler.post { addNextService() }
         }
 
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            currentMtu = mtu
+        }
+
+        override fun onNotificationSent(device: BluetoothDevice, gattStatus: Int) {
+            handler.post {
+                syncInFlight = false
+                pumpSync()
+            }
+        }
+
         override fun onConnectionStateChange(device: BluetoothDevice, gattStatus: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 hrSubscribers.remove(device)
                 batterySubscribers.remove(device)
                 eventSubscribers.remove(device)
+                authorized.remove(device)
+                authNonces.remove(device)
+                if (syncDevice == device) {
+                    syncDevice = null
+                    syncQueue.clear()
+                    syncInFlight = false
+                }
                 status("Déconnecté, en attente…")
             } else if (newState == BluetoothProfile.STATE_CONNECTED) {
                 status("iPhone connecté")
@@ -634,7 +1007,15 @@ class HeartRateService : Service(), SensorEventListener {
         ) {
             if (descriptor.uuid == CCCD) {
                 val enabled = value.isNotEmpty() && value[0].toInt() != 0
-                when (descriptor.characteristic.uuid) {
+                val characteristicUuid = descriptor.characteristic.uuid
+                // Seule la liaison est ouverte à tous : le reste exige un iPhone lié
+                if (enabled && characteristicUuid != CTRL_AUTH && !authorized.contains(device)) {
+                    if (responseNeeded) {
+                        respond(device, requestId, BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION, null)
+                    }
+                    return
+                }
+                when (characteristicUuid) {
                     HR_MEASUREMENT -> {
                         if (enabled) {
                             hrSubscribers.add(device)
@@ -655,7 +1036,10 @@ class HeartRateService : Service(), SensorEventListener {
                     CTRL_EVENT -> {
                         if (enabled) {
                             eventSubscribers.add(device)
-                            handler.post { notifySteps() }
+                            handler.post {
+                                notifySteps()
+                                notifyWorn()
+                            }
                         } else {
                             eventSubscribers.remove(device)
                         }
@@ -690,10 +1074,22 @@ class HeartRateService : Service(), SensorEventListener {
             offset: Int,
             characteristic: BluetoothGattCharacteristic
         ) {
-            if (characteristic.uuid == BATTERY_LEVEL) {
-                respond(device, requestId, BluetoothGatt.GATT_SUCCESS, byteArrayOf(batteryPercent().toByte()))
-            } else {
-                respond(device, requestId, BluetoothGatt.GATT_READ_NOT_PERMITTED, null)
+            when (characteristic.uuid) {
+                BATTERY_LEVEL -> {
+                    if (authorized.contains(device)) {
+                        respond(device, requestId, BluetoothGatt.GATT_SUCCESS, byteArrayOf(batteryPercent().toByte()))
+                    } else {
+                        respond(device, requestId, BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION, null)
+                    }
+                }
+                CTRL_AUTH -> {
+                    // Un défi aléatoire à chaque lecture : l'iPhone doit le signer pour prouver qu'il connaît la clé ou le code
+                    val nonce = Crypto.randomBytes(16)
+                    authNonces[device] = nonce
+                    val header = if (loadLtk() != null) AUTH_READ_PAIRED else AUTH_READ_UNPAIRED
+                    respond(device, requestId, BluetoothGatt.GATT_SUCCESS, byteArrayOf(header.toByte()) + nonce)
+                }
+                else -> respond(device, requestId, BluetoothGatt.GATT_READ_NOT_PERMITTED, null)
             }
         }
 
@@ -706,11 +1102,22 @@ class HeartRateService : Service(), SensorEventListener {
             offset: Int,
             value: ByteArray
         ) {
-            if (characteristic.uuid == CTRL_COMMAND) {
-                handler.post { handleCommand(value) }
-                if (responseNeeded) respond(device, requestId, BluetoothGatt.GATT_SUCCESS, value)
-            } else if (responseNeeded) {
-                respond(device, requestId, BluetoothGatt.GATT_WRITE_NOT_PERMITTED, null)
+            when (characteristic.uuid) {
+                CTRL_AUTH -> {
+                    handler.post { handleAuth(device, value) }
+                    if (responseNeeded) respond(device, requestId, BluetoothGatt.GATT_SUCCESS, value)
+                }
+                CTRL_COMMAND -> {
+                    if (authorized.contains(device)) {
+                        handler.post { handleCommand(device, value) }
+                        if (responseNeeded) respond(device, requestId, BluetoothGatt.GATT_SUCCESS, value)
+                    } else if (responseNeeded) {
+                        respond(device, requestId, BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION, null)
+                    }
+                }
+                else -> if (responseNeeded) {
+                    respond(device, requestId, BluetoothGatt.GATT_WRITE_NOT_PERMITTED, null)
+                }
             }
         }
     }
@@ -723,8 +1130,8 @@ class HeartRateService : Service(), SensorEventListener {
         }
     }
 
-    /** Commandes envoyées par l'iPhone. */
-    private fun handleCommand(value: ByteArray) {
+    /** Commandes envoyées par un iPhone lié. */
+    private fun handleCommand(device: BluetoothDevice, value: ByteArray) {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         when (value.firstOrNull()?.toInt()) {
             CMD_RING_START -> startRing()
@@ -750,11 +1157,19 @@ class HeartRateService : Service(), SensorEventListener {
                     applyInterval()
                 }
             }
+            CMD_SYNC_REQUEST -> if (value.size >= 5) {
+                var since = 0L
+                for (k in 0 until 4) {
+                    since = since or ((value[1 + k].toLong() and 0xFF) shl (8 * k))
+                }
+                startSync(device, since)
+            }
         }
     }
 
     private fun notifyHeartRate(bpm: Int) {
         val characteristic = hrCharacteristic ?: return
+        if (syncActive()) return
         // Format "Heart Rate Measurement" : octet de flags (0 = valeur sur 8 bits), puis le BPM
         val payload = byteArrayOf(0x00, bpm.coerceIn(0, 255).toByte())
         for (device in hrSubscribers) {
@@ -762,6 +1177,19 @@ class HeartRateService : Service(), SensorEventListener {
                 gattServer?.notifyCharacteristicChanged(device, characteristic, false, payload)
             } catch (e: SecurityException) {
                 Log.w(TAG, "notify: $e")
+            }
+        }
+    }
+
+    /** Envoie un événement à tous les iPhone liés et abonnés. */
+    private fun sendEvent(payload: ByteArray) {
+        val characteristic = eventCharacteristic ?: return
+        if (syncActive()) return
+        for (device in eventSubscribers) {
+            try {
+                gattServer?.notifyCharacteristicChanged(device, characteristic, false, payload)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "notify événement: $e")
             }
         }
     }

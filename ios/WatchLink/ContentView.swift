@@ -12,6 +12,9 @@ struct ContentView: View {
             ActivityView(manager: manager, history: manager.history)
                 .tabItem { Label("Activité", systemImage: "figure.walk") }
 
+            SleepView(history: manager.history)
+                .tabItem { Label("Santé", systemImage: "bed.double.fill") }
+
             HistoryView(history: manager.history)
                 .tabItem { Label("Historique", systemImage: "chart.xyaxis.line") }
 

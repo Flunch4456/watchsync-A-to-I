@@ -177,6 +177,59 @@ final class HistoryStore: ObservableObject {
         batteryLog.append(Sample(t: t, b: level))
     }
 
+    // MARK: - Mesures prises par la montre hors connexion
+
+    /// Heure de la dernière mesure cardiaque connue (pour ne redemander que le nouveau).
+    var lastHeartRateTime: Int? {
+        sessions.compactMap { $0.samples.last?.t }.max()
+    }
+
+    private static let utcDayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    /// Ajoute ce que la montre a enregistré pendant la déconnexion. `cutoff` = instant de la reconnexion :
+    /// au-delà, les mesures arrivent déjà en direct, on les ignore pour ne pas les compter deux fois.
+    /// Renvoie le nombre de mesures cardiaques ajoutées.
+    @discardableResult
+    func mergeSync(heart: [(Int, Int)], battery: [(Int, Int)], steps: [(Int, Int)], cutoff: Int) -> Int {
+        let known = Set(sessions.flatMap { $0.samples.map { $0.t } })
+        let fresh = heart
+            .filter { $0.0 < cutoff && $0.1 > 0 && !known.contains($0.0) }
+            .sorted { $0.0 < $1.0 }
+
+        var block: [Sample] = []
+        func flush() {
+            if let first = block.first {
+                sessions.append(Session(id: UUID(), start: first.t, samples: block))
+            }
+            block = []
+        }
+        for (t, b) in fresh {
+            if let last = block.last, t - last.t > 300 { flush() }
+            block.append(Sample(t: t, b: b))
+        }
+        flush()
+        sessions.sort { $0.start < $1.start }
+
+        let knownBattery = Set(batteryLog.map { $0.t })
+        for (t, level) in battery where t < cutoff && !knownBattery.contains(t) {
+            batteryLog.append(Sample(t: t, b: level))
+        }
+        batteryLog.sort { $0.t < $1.t }
+
+        for (epochDay, count) in steps {
+            let day = Self.utcDayFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(epochDay) * 86400))
+            dailySteps[day] = Swift.max(dailySteps[day] ?? 0, count)
+        }
+        save()
+        return fresh.count
+    }
+
     // MARK: - Fichiers
 
     func save() {
