@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.hrInterval) private var hrInterval = 1
     @AppStorage(SettingsKey.heightCm) private var heightCm = 175
     @AppStorage(SettingsKey.offWristNotify) private var offWristNotify = true
+    @AppStorage(SettingsKey.mirrorNotifications) private var mirror = false
 
     var body: some View {
         NavigationStack {
@@ -94,11 +95,11 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Text("L'affichage des notifications de l'iPhone sur la montre arrive dans un prochain lot (iOS impose un mécanisme à part). Le réglage pour l'activer ou le désactiver sera ici.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    Toggle("Afficher les notifications de l'iPhone", isOn: $mirror)
                 } header: {
                     Text("Notifications sur la montre")
+                } footer: {
+                    Text("Au premier essai, iOS demande d'appairer la montre : accepte. Puis dans Réglages iOS > Bluetooth > (i) à côté de la montre, active « Partager les notifications du système ». Sans ça, iOS ne les transmet pas.")
                 }
 
                 if manager.connectedName != nil {
@@ -120,6 +121,7 @@ struct SettingsView: View {
             .onChange(of: alertPhone) { _ in manager.sendConfig() }
             .onChange(of: autostart) { _ in manager.sendConfig() }
             .onChange(of: hrInterval) { _ in manager.sendConfig() }
+            .onChange(of: mirror) { _ in manager.sendConfig() }
         }
     }
 }

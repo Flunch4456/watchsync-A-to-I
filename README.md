@@ -7,6 +7,11 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Nouveautés de la version 0.5.0
+
+- **Notifications iPhone → montre** (réglage dans Réglages > Notifications sur la montre) : la montre se connecte au service de notifications d'Apple (ANCS). Il faut l'appairer (iOS le propose) puis activer « Partager les notifications du système » dans Réglages iOS > Bluetooth > (i) à côté de la montre. Retour arrière : branche `stable-v0.4.0`.
+- **Sonnerie de l'iPhone** : bip en boucle même écran éteint (mode audio en arrière-plan), en plus des notifications sonores de secours. Le volume dépend de celui de l'iPhone.
+
 ## Nouveautés de la version 0.4.0
 
 - **Liaison par code** : sur la montre, touche « Lier l'iPhone » → un code à 6 chiffres s'affiche (valable 2 min). Tape-le sur l'iPhone. Ensuite la montre ne parle qu'à cet iPhone. Pour changer d'iPhone, « Oublier la liaison » sur la montre.

@@ -83,6 +83,7 @@ class HeartRateService : Service(), SensorEventListener {
         private const val KEY_STEP_CARRY = "step_carry"
         private const val KEY_STEP_LAST = "step_last"
         private const val KEY_LTK = "ltk"
+        private const val KEY_MIRROR = "mirror_notifications"
 
         private fun std(short: String): UUID =
             UUID.fromString("0000$short-0000-1000-8000-00805f9b34fb")
@@ -107,6 +108,7 @@ class HeartRateService : Service(), SensorEventListener {
         private const val CMD_SET_ALERT = 0x10 // [0x10, bas, haut, flags] (0 = désactivé, flags bit0 = vibration)
         private const val CMD_SET_AUTOSTART = 0x30 // [0x30, 0 ou 1]
         private const val CMD_SET_INTERVAL = 0x40 // [0x40, hi, lo] secondes entre deux mesures (0 = désactivée)
+        private const val CMD_SET_MIRROR = 0x60 // [0x60, 0 ou 1] affiche les notifications de l'iPhone
         private const val CMD_SYNC_REQUEST = 0x50 // [0x50, 4 octets] envoie tout ce qui est plus récent (secondes)
 
         // Événements (montre vers iPhone) : premier octet de la notification
@@ -170,6 +172,7 @@ class HeartRateService : Service(), SensorEventListener {
     private var syncDevice: BluetoothDevice? = null
     private var syncInFlight = false
     private var currentMtu = 23
+    private var ancs: AncsClient? = null
 
     private var lastBpm = 0
     private var lastAlertAt = 0L
@@ -256,6 +259,8 @@ class HeartRateService : Service(), SensorEventListener {
         authNonces.clear()
         syncQueue.clear()
         syncDevice = null
+        ancs?.stop()
+        ancs = null
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         status("Arrêté")
@@ -724,6 +729,7 @@ class HeartRateService : Service(), SensorEventListener {
                     authNonces.remove(device)
                     notifyAuth(device, byteArrayOf(AUTH_OK.toByte()))
                     status("iPhone lié et connecté")
+                    applyMirror(device)
                 } else {
                     notifyAuth(device, denied)
                 }
@@ -743,6 +749,7 @@ class HeartRateService : Service(), SensorEventListener {
                         endPairing()
                         notifyAuth(device, byteArrayOf(AUTH_PAIRED.toByte()) + Crypto.xor(ltk, stream))
                         status("iPhone lié")
+                        applyMirror(device)
                         return
                     }
                     pairingAttempts++
@@ -751,6 +758,23 @@ class HeartRateService : Service(), SensorEventListener {
                 notifyAuth(device, denied)
             }
             else -> notifyAuth(device, denied)
+        }
+    }
+
+    // --- Notifications de l'iPhone affichées sur la montre (ANCS) ---------------------
+
+    private fun applyMirror(device: BluetoothDevice) {
+        val enabled = getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_MIRROR, false)
+        if (!enabled) {
+            ancs?.stop()
+            return
+        }
+        try {
+            val client = ancs ?: AncsClient(this) { text -> status(text) }.also { ancs = it }
+            client.start(device)
+        } catch (e: Exception) {
+            Log.w(TAG, "ANCS: $e")
+            status("Notifications iPhone : erreur")
         }
     }
 
@@ -985,6 +1009,7 @@ class HeartRateService : Service(), SensorEventListener {
                 eventSubscribers.remove(device)
                 authorized.remove(device)
                 authNonces.remove(device)
+                ancs?.stop()
                 if (syncDevice == device) {
                     syncDevice = null
                     syncQueue.clear()
@@ -1156,6 +1181,10 @@ class HeartRateService : Service(), SensorEventListener {
                     prefs.edit().putInt(KEY_HR_INTERVAL, seconds).apply()
                     applyInterval()
                 }
+            }
+            CMD_SET_MIRROR -> if (value.size >= 2) {
+                prefs.edit().putBoolean(KEY_MIRROR, value[1].toInt() != 0).apply()
+                applyMirror(device)
             }
             CMD_SYNC_REQUEST -> if (value.size >= 5) {
                 var since = 0L

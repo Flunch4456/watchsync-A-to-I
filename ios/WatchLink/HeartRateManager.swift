@@ -1,3 +1,4 @@
+import AVFoundation
 import AudioToolbox
 import CoreBluetooth
 import CryptoKit
@@ -15,6 +16,7 @@ enum SettingsKey {
     static let hrInterval = "hrInterval"
     static let heightCm = "heightCm"
     static let offWristNotify = "offWristNotify"
+    static let mirrorNotifications = "mirrorNotifications"
 }
 
 /// Ce que la montre est en train de faire pour qu'on la retrouve.
@@ -96,7 +98,8 @@ final class HeartRateManager: NSObject, ObservableObject {
             SettingsKey.autostart: true,
             SettingsKey.hrInterval: 1,
             SettingsKey.heightCm: 175,
-            SettingsKey.offWristNotify: true
+            SettingsKey.offWristNotify: true,
+            SettingsKey.mirrorNotifications: false
         ])
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermission()
@@ -186,6 +189,7 @@ final class HeartRateManager: NSObject, ObservableObject {
         let flags: UInt8 = d.bool(forKey: SettingsKey.alertVibrate) ? 1 : 0
         write([0x10, UInt8(clamping: low), UInt8(clamping: high), flags])
         write([0x30, d.bool(forKey: SettingsKey.autostart) ? 1 : 0])
+        write([0x60, d.bool(forKey: SettingsKey.mirrorNotifications) ? 1 : 0])
 
         let seconds = UInt16(clamping: d.integer(forKey: SettingsKey.hrInterval))
         write([0x40, UInt8(seconds >> 8), UInt8(seconds & 0xFF)])
@@ -601,6 +605,7 @@ extension HeartRateManager: CBPeripheralDelegate {
 /// on programme alors une série de notifications sonores qui se déclenchent seules.
 final class PhoneFinder {
     private var timer: Timer?
+    private var player: AVAudioPlayer?
     private static let prefix = "finder-"
 
     func handle(kind: Int) {
@@ -622,6 +627,7 @@ final class PhoneFinder {
             let trigger = UNTimeIntervalNotificationTrigger(timeInterval: Double(i * 5 + 1), repeats: false)
             center.add(UNNotificationRequest(identifier: Self.prefix + "\(i)", content: content, trigger: trigger))
         }
+        startAudio(loud: ring)
         var ticks = 0
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] t in
             ticks += 1
@@ -634,7 +640,47 @@ final class PhoneFinder {
         }
     }
 
+    /// Une session audio « lecture » garde l'app vivante écran éteint (mode audio en arrière-plan)
+    /// et joue un bip en boucle, même en mode silencieux. Pour la vibration seule, le volume est à zéro.
+    private func startAudio(loud: Bool) {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+            try AVAudioSession.sharedInstance().setActive(true)
+            let p = try AVAudioPlayer(data: Self.beepWav())
+            p.numberOfLoops = -1
+            p.volume = loud ? 1.0 : 0.0
+            p.play()
+            player = p
+        } catch {
+            player = nil
+        }
+    }
+
+    /// Bip de 880 Hz pendant 0,4 s puis silence de 0,4 s, au format WAV 16 bits mono.
+    private static func beepWav() -> Data {
+        let rate = 22050
+        let count = rate * 8 / 10
+        var samples = [Int16](repeating: 0, count: count)
+        for i in 0..<(rate * 4 / 10) {
+            samples[i] = Int16(sin(2 * Double.pi * 880 * Double(i) / Double(rate)) * 28000)
+        }
+        func le32(_ v: Int) -> [UInt8] { (0..<4).map { UInt8((v >> (8 * $0)) & 0xFF) } }
+        func le16(_ v: Int) -> [UInt8] { (0..<2).map { UInt8((v >> (8 * $0)) & 0xFF) } }
+        var d = Data()
+        d.append(contentsOf: Array("RIFF".utf8)); d.append(contentsOf: le32(36 + count * 2))
+        d.append(contentsOf: Array("WAVEfmt ".utf8)); d.append(contentsOf: le32(16))
+        d.append(contentsOf: le16(1)); d.append(contentsOf: le16(1))
+        d.append(contentsOf: le32(rate)); d.append(contentsOf: le32(rate * 2))
+        d.append(contentsOf: le16(2)); d.append(contentsOf: le16(16))
+        d.append(contentsOf: Array("data".utf8)); d.append(contentsOf: le32(count * 2))
+        for v in samples { d.append(contentsOf: le16(Int(UInt16(bitPattern: v)))) }
+        return d
+    }
+
     private func stop() {
+        player?.stop()
+        player = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         timer?.invalidate()
         timer = nil
         let ids = (0..<12).map { Self.prefix + "\($0)" }
