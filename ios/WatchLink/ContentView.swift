@@ -2,47 +2,23 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var manager = HeartRateManager()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        VStack(spacing: 20) {
-            Text("WatchLink")
-                .font(.title2.bold())
+        TabView {
+            LiveView(manager: manager, history: manager.history)
+                .tabItem { Label("En direct", systemImage: "heart.fill") }
 
-            VStack(spacing: 4) {
-                Text(manager.bpm.map { String($0) } ?? "--")
-                    .font(.system(size: 96, weight: .bold, design: .rounded))
-                Text("battements / minute")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
+            HistoryView(history: manager.history)
+                .tabItem { Label("Historique", systemImage: "chart.xyaxis.line") }
 
-            Text(manager.status)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-
-            if let name = manager.connectedName {
-                Label(name, systemImage: "applewatch")
-                Button("Oublier cette montre", role: .destructive) {
-                    manager.forget()
-                }
-            } else {
-                List(manager.found) { item in
-                    Button {
-                        manager.connect(item.peripheral)
-                    } label: {
-                        Label(item.name, systemImage: "dot.radiowaves.left.and.right")
-                    }
-                }
-                .frame(maxHeight: 240)
-
-                Button("Relancer la recherche") {
-                    manager.startScan()
-                }
-            }
-
-            Spacer()
+            SettingsView(manager: manager)
+                .tabItem { Label("Réglages", systemImage: "gearshape") }
         }
-        .padding()
+        .tint(.red)
+        .onChange(of: scenePhase) { phase in
+            // On enregistre l'historique dès que l'app quitte le premier plan
+            if phase != .active { manager.history.save() }
+        }
     }
 }

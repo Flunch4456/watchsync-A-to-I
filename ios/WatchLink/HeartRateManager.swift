@@ -1,8 +1,21 @@
 import CoreBluetooth
 import Foundation
+import UserNotifications
 
-/// Client Bluetooth Low Energy : se connecte à la montre (qui joue le rôle de serveur
-/// "Heart Rate", service 0x180D) et reçoit les battements par notification.
+/// Clés des réglages (partagées avec l'écran Réglages via @AppStorage).
+enum SettingsKey {
+    static let alertEnabled = "alertEnabled"
+    static let alertLow = "alertLow"
+    static let alertHigh = "alertHigh"
+    static let alertVibrate = "alertVibrate"
+    static let alertPhone = "alertPhone"
+    static let autostart = "autostart"
+}
+
+/// Client Bluetooth Low Energy : se connecte à la montre, qui joue le rôle de serveur.
+///  - Heart Rate (0x180D) : battements par notification
+///  - Battery (0x180F) : niveau de batterie
+///  - service de commandes maison : sonnerie, seuils d'alerte, démarrage auto
 final class HeartRateManager: NSObject, ObservableObject {
 
     struct Found: Identifiable {
@@ -15,16 +28,37 @@ final class HeartRateManager: NSObject, ObservableObject {
     @Published var status = "Initialisation…"
     @Published var found: [Found] = []
     @Published var connectedName: String?
+    @Published var battery: Int?
+    @Published var ringing = false
+    @Published var controlAvailable = false
 
-    private static let heartRateService = CBUUID(string: "180D")
-    private static let heartRateMeasurement = CBUUID(string: "2A37")
+    let history = HistoryStore()
+
+    private static let hrService = CBUUID(string: "180D")
+    private static let hrMeasurement = CBUUID(string: "2A37")
+    private static let batteryService = CBUUID(string: "180F")
+    private static let batteryLevel = CBUUID(string: "2A19")
+    private static let controlService = CBUUID(string: "9F2B0001-6C1D-4A57-8E3B-5D6A7C8E9F10")
+    private static let controlCommand = CBUUID(string: "9F2B0002-6C1D-4A57-8E3B-5D6A7C8E9F10")
     private static let savedKey = "savedPeripheralID"
 
     private var central: CBCentralManager!
     private var current: CBPeripheral?
+    private var commandChar: CBCharacteristic?
+    private var ringReset: DispatchWorkItem?
+    private var lastPhoneAlert = Date.distantPast
 
     override init() {
         super.init()
+        UserDefaults.standard.register(defaults: [
+            SettingsKey.alertEnabled: false,
+            SettingsKey.alertLow: 50,
+            SettingsKey.alertHigh: 130,
+            SettingsKey.alertVibrate: true,
+            SettingsKey.alertPhone: true,
+            SettingsKey.autostart: true
+        ])
+        UNUserNotificationCenter.current().delegate = self
         // La clé de restauration permet à iOS de relancer l'app en arrière-plan
         // quand la montre se reconnecte.
         central = CBCentralManager(
@@ -34,14 +68,14 @@ final class HeartRateManager: NSObject, ObservableObject {
         )
     }
 
-    // MARK: - Actions de l'interface
+    // MARK: - Connexion
 
     func startScan() {
         guard central.state == .poweredOn else { return }
         found.removeAll()
         status = "Recherche de la montre…"
         central.scanForPeripherals(
-            withServices: [Self.heartRateService],
+            withServices: [Self.hrService],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
     }
@@ -57,15 +91,12 @@ final class HeartRateManager: NSObject, ObservableObject {
     }
 
     func forget() {
+        UserDefaults.standard.removeObject(forKey: Self.savedKey)
         if let p = current { central.cancelPeripheralConnection(p) }
         current = nil
-        connectedName = nil
-        bpm = nil
-        UserDefaults.standard.removeObject(forKey: Self.savedKey)
+        resetLiveState()
         startScan()
     }
-
-    // MARK: - Reconnexion automatique
 
     private func reconnectSavedOrScan() {
         if let s = UserDefaults.standard.string(forKey: Self.savedKey),
@@ -76,6 +107,82 @@ final class HeartRateManager: NSObject, ObservableObject {
             startScan()
         }
     }
+
+    private func resetLiveState() {
+        bpm = nil
+        battery = nil
+        connectedName = nil
+        controlAvailable = false
+        commandChar = nil
+        ringing = false
+        history.endSession()
+    }
+
+    // MARK: - Commandes vers la montre
+
+    private func write(_ bytes: [UInt8]) {
+        guard let p = current, let c = commandChar else { return }
+        p.writeValue(Data(bytes), for: c, type: .withResponse)
+    }
+
+    /// Envoie les réglages à la montre (seuils, vibration, démarrage auto).
+    func sendConfig() {
+        let d = UserDefaults.standard
+        let enabled = d.bool(forKey: SettingsKey.alertEnabled)
+        let low = enabled ? d.integer(forKey: SettingsKey.alertLow) : 0
+        let high = enabled ? d.integer(forKey: SettingsKey.alertHigh) : 0
+        let flags: UInt8 = d.bool(forKey: SettingsKey.alertVibrate) ? 1 : 0
+        write([0x10, UInt8(clamping: low), UInt8(clamping: high), flags])
+        write([0x30, d.bool(forKey: SettingsKey.autostart) ? 1 : 0])
+    }
+
+    func toggleRing() {
+        ringing.toggle()
+        write([ringing ? 0x01 : 0x02])
+        ringReset?.cancel()
+        if ringing {
+            // La montre coupe la sonnerie seule au bout d'une minute
+            let item = DispatchWorkItem { [weak self] in self?.ringing = false }
+            ringReset = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: item)
+        }
+    }
+
+    // MARK: - Alertes sur l'iPhone
+
+    func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func checkAlert(_ bpm: Int) {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: SettingsKey.alertEnabled), d.bool(forKey: SettingsKey.alertPhone) else { return }
+        let low = d.integer(forKey: SettingsKey.alertLow)
+        let high = d.integer(forKey: SettingsKey.alertHigh)
+        let tooLow = low > 0 && bpm < low
+        let tooHigh = high > 0 && bpm > high
+        // Une notification au maximum toutes les 2 minutes
+        guard tooLow || tooHigh, Date().timeIntervalSince(lastPhoneAlert) > 120 else { return }
+        lastPhoneAlert = Date()
+
+        let content = UNMutableNotificationContent()
+        content.title = "Rythme cardiaque"
+        content.body = tooHigh ? "\(bpm) bpm : au-dessus de \(high)" : "\(bpm) bpm : en dessous de \(low)"
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+}
+
+// MARK: - UNUserNotificationCenterDelegate
+
+extension HeartRateManager: UNUserNotificationCenterDelegate {
+    /// Affiche aussi la bannière quand l'app est ouverte.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
 }
 
 // MARK: - CBCentralManagerDelegate
@@ -85,7 +192,16 @@ extension HeartRateManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
-            if current == nil { reconnectSavedOrScan() }
+            if let p = current {
+                // App relancée par iOS avec une connexion déjà active
+                if p.state == .connected {
+                    p.discoverServices([Self.hrService, Self.batteryService, Self.controlService])
+                } else {
+                    central.connect(p, options: nil)
+                }
+            } else {
+                reconnectSavedOrScan()
+            }
         case .poweredOff:
             status = "Bluetooth désactivé"
         case .unauthorized:
@@ -118,7 +234,7 @@ extension HeartRateManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         connectedName = peripheral.name ?? "Montre"
         status = "Connecté, attente des mesures…"
-        peripheral.discoverServices([Self.heartRateService])
+        peripheral.discoverServices([Self.hrService, Self.batteryService, Self.controlService])
     }
 
     func centralManager(_ central: CBCentralManager,
@@ -131,8 +247,7 @@ extension HeartRateManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        bpm = nil
-        connectedName = nil
+        resetLiveState()
         // Si l'utilisateur a oublié la montre, on ne se reconnecte pas
         guard UserDefaults.standard.string(forKey: Self.savedKey) == peripheral.identifier.uuidString else { return }
         status = "Montre déconnectée, reconnexion automatique…"
@@ -146,24 +261,46 @@ extension HeartRateManager: CBCentralManagerDelegate {
 extension HeartRateManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let service = peripheral.services?.first(where: { $0.uuid == Self.heartRateService }) else {
-            status = "Service cardiaque introuvable"
+        guard let services = peripheral.services, !services.isEmpty else {
+            status = "Services introuvables : oublie la montre puis reconnecte-la"
             return
         }
-        peripheral.discoverCharacteristics([Self.heartRateMeasurement], for: service)
+        for service in services {
+            peripheral.discoverCharacteristics(nil, for: service)
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        guard let c = service.characteristics?.first(where: { $0.uuid == Self.heartRateMeasurement }) else { return }
-        peripheral.setNotifyValue(true, for: c)
+        for c in service.characteristics ?? [] {
+            switch c.uuid {
+            case Self.hrMeasurement:
+                peripheral.setNotifyValue(true, for: c)
+            case Self.batteryLevel:
+                peripheral.readValue(for: c)
+                peripheral.setNotifyValue(true, for: c)
+            case Self.controlCommand:
+                commandChar = c
+                controlAvailable = true
+                sendConfig()
+            default:
+                break
+            }
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard let data = characteristic.value, data.count >= 2 else { return }
+        guard let data = characteristic.value else { return }
+
+        if characteristic.uuid == Self.batteryLevel {
+            if let level = data.first { battery = Int(level) }
+            return
+        }
+
+        guard characteristic.uuid == Self.hrMeasurement, data.count >= 2 else { return }
         let flags = data[0]
         // Bit 0 des flags : 0 = BPM sur 8 bits, 1 = BPM sur 16 bits
         let value: Int
@@ -176,5 +313,7 @@ extension HeartRateManager: CBPeripheralDelegate {
         }
         bpm = value
         status = "Mesure en direct"
+        history.add(bpm: value)
+        checkAlert(value)
     }
 }

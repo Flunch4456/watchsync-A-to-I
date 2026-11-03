@@ -7,6 +7,22 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Fonctions (version 0.2.0)
+
+App iPhone, trois onglets :
+
+- **En direct** : battements, niveau de batterie de la montre, min / moyenne / max de la session, courbe des 2 dernières minutes.
+- **Historique** : sessions des 7 derniers jours avec courbe et statistiques, export CSV (par session ou tout d'un coup).
+- **Réglages** : alertes de rythme (seuils bas et haut, vibration de la montre, notification iPhone), démarrage automatique de la montre, bouton pour faire sonner la montre.
+
+App montre : diffusion en arrière-plan écran éteint (service au premier plan), reprise automatique après un redémarrage, vibration d'alerte, sonnerie de recherche (coupée seule après 1 minute ou avec le bouton « Couper la sonnerie »).
+
+Pas encore : l'affichage des notifications de l'iPhone sur la montre (étape suivante).
+
+Pour revenir à la première version stable : le tag `v0.1.0-stable` de ce dépôt.
+
+Conseil pour que Samsung ne coupe pas l'app en arrière-plan : `adb shell dumpsys deviceidle whitelist +fr.nino.watchlink`
+
 ## 1. Compiler (sur GitHub, sans Mac)
 
 1. Pousse ce dossier dans un dépôt GitHub.

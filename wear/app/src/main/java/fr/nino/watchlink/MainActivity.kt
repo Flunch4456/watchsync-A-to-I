@@ -2,6 +2,7 @@ package fr.nino.watchlink
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -51,10 +52,21 @@ class MainActivity : Activity() {
         toggle = Button(this).apply {
             setOnClickListener { onToggle() }
         }
+        // Coupe la sonnerie "retrouver ma montre" lancée depuis l'iPhone
+        val stopRing = Button(this).apply {
+            text = "Couper la sonnerie"
+            setOnClickListener {
+                startService(
+                    Intent(this@MainActivity, HeartRateService::class.java)
+                        .setAction(HeartRateService.ACTION_STOP_RING)
+                )
+            }
+        }
 
         column.addView(bpmText, wrap())
         column.addView(statusText, wrap())
         column.addView(toggle, wrap())
+        column.addView(stopRing, wrap())
 
         setContentView(ScrollView(this).apply { addView(column) })
         refreshButton()
@@ -75,18 +87,28 @@ class MainActivity : Activity() {
 
     private fun onToggle() {
         if (HeartRateService.running) {
+            // Arrêt voulu : on ne relance pas la diffusion au prochain redémarrage
+            setAutostart(false)
             stopService(Intent(this, HeartRateService::class.java))
             bpmText.text = "--"
             statusText.text = "Arrêté"
             // `running` repasse à false dans onDestroy du service, on met le bouton à jour tout de suite
             toggle.text = "Démarrer"
         } else if (hasAllPermissions()) {
+            setAutostart(true)
             startForegroundService(Intent(this, HeartRateService::class.java))
             toggle.text = "Arrêter"
             statusText.text = "Démarrage…"
         } else {
             requestPermissions(permissions, 1)
         }
+    }
+
+    private fun setAutostart(value: Boolean) {
+        getSharedPreferences(HeartRateService.PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(HeartRateService.KEY_AUTOSTART, value)
+            .apply()
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
