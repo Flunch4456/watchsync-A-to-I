@@ -247,13 +247,13 @@ class HeartRateService : Service(), SensorEventListener {
     private fun intervalSec(): Int =
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_HR_INTERVAL, 1)
 
-    private val dutyRunnable = Runnable {
+    private val dutyRunnable: Runnable = Runnable {
         startHr()
         handler.postDelayed(measureTimeoutRunnable, MEASURE_TIMEOUT_MS)
     }
 
     /** Si aucune mesure valide n'arrive (montre mal portée), on coupe le capteur et on réessaiera plus tard. */
-    private val measureTimeoutRunnable = Runnable {
+    private val measureTimeoutRunnable: Runnable = Runnable {
         stopHr()
         handler.postDelayed(dutyRunnable, intervalSec() * 1000L)
     }
