@@ -1,0 +1,28 @@
+name: WatchLink
+options:
+  bundleIdPrefix: fr.nino
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  WatchLink:
+    type: application
+    platform: iOS
+    sources:
+      - WatchLink
+    info:
+      path: WatchLink/Info.plist
+      properties:
+        CFBundleDisplayName: WatchLink
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSBluetoothAlwaysUsageDescription: "WatchLink se connecte à ta montre pour afficher ton rythme cardiaque."
+        UIBackgroundModes:
+          - bluetooth-central
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: fr.nino.watchlink
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"

@@ -1,0 +1,7 @@
+.gradle/
+build/
+local.properties
+*.xcodeproj/
+Payload/
+*.ipa
+.DS_Store
