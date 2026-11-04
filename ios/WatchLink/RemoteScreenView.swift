@@ -15,6 +15,18 @@ struct RemoteScreenView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                if active {
+                    Label(manager.fastChannel ? "Canal rapide actif" : "Mode lent (canal rapide non ouvert)",
+                          systemImage: manager.fastChannel ? "bolt.fill" : "tortoise.fill")
+                        .font(.footnote.bold())
+                        .foregroundStyle(manager.fastChannel ? .green : .orange)
+                    if let error = manager.channelError, !manager.fastChannel {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.center)
+                    }
+                }
                 screen
                 navigation
                 settings
@@ -34,7 +46,7 @@ struct RemoteScreenView: View {
 
     private var footer: String {
         if noAnswer && manager.remoteState == 0 {
-            return "La montre n'a pas répondu. Vérifie que l'APK installé sur la montre est bien la version 0.9.0 ou plus récente (visible dans Contrôle de la montre), et que la montre est connectée."
+            return "La montre n'a pas répondu. Vérifie que l'APK installé sur la montre est bien la version 0.9.1 ou plus récente (visible dans Contrôle de la montre), et que la montre est connectée."
         }
         switch manager.remoteState {
         case 1: return "Quelques images par seconde. L'écran de la montre reste allumé et l'affichage s'arrête seul au bout de 5 minutes."

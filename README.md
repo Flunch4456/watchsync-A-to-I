@@ -7,6 +7,10 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Version 0.9.1 : canal rapide
+
+- Le numéro du canal rapide est maintenant envoyé avant toute image (il était bloqué par les images), répété jusqu'à la connexion, et l'écran à distance indique « Canal rapide actif » ou « Mode lent » avec la raison en cas de refus. Retour arrière : branche `stable-v0.9.0`.
+
 ## Version 0.9.0 : écran à distance plus rapide et plus net
 
 - Les images passent par un canal Bluetooth dédié (L2CAP), bien plus rapide que les notifications. Si le canal ne s'ouvre pas, l'app revient toute seule à l'ancien mode.

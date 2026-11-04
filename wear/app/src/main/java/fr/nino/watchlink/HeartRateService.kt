@@ -818,6 +818,8 @@ class HeartRateService : Service(), SensorEventListener {
     private var frameId = 0
     private var screenLock: PowerManager.WakeLock? = null
     private var lastFrame: ByteArray? = null
+    private var remoteStartedAt = 0L
+    private var l2capWanted = false
 
     // Canal rapide (L2CAP) : beaucoup plus de débit que les notifications Bluetooth
     private var l2capServer: BluetoothServerSocket? = null
@@ -925,10 +927,15 @@ class HeartRateService : Service(), SensorEventListener {
         sendEvent(byteArrayOf(EVENT_REMOTE.toByte(), 1))
         // Le numéro du canal rapide part un peu après, pour ne pas collisionner avec l'événement précédent
         val psm = startL2cap()
+        remoteStartedAt = SystemClock.elapsedRealtime()
+        l2capWanted = psm > 0
         if (psm > 0) {
+            // Aucune image ne part avant que le canal soit ouvert (ou 4 s écoulées) : sinon les images
+            // occupent le Bluetooth et ce message serait bloqué. On le répète tant que l'iPhone ne s'est pas connecté.
             val packet = byteArrayOf(EVENT_PSM.toByte(), ((psm shr 8) and 0xFF).toByte(), (psm and 0xFF).toByte())
-            handler.postDelayed({ if (remoteOn) sendEvent(packet) }, 300)
-            handler.postDelayed({ if (remoteOn && l2capOut == null) sendEvent(packet) }, 2500)
+            for (delay in longArrayOf(300, 1200, 2200, 3200)) {
+                handler.postDelayed({ if (remoteOn && l2capOut == null) sendEvent(packet) }, delay)
+            }
         }
         // Arrêt automatique au bout de 5 minutes pour protéger la batterie
         handler.removeCallbacks(remoteStopRunnable)
@@ -963,6 +970,11 @@ class HeartRateService : Service(), SensorEventListener {
             } else {
                 handler.postDelayed(remoteRunnable, 400)
             }
+            return
+        }
+        // On laisse d'abord sa chance au canal rapide (4 s au plus), avant de se rabattre sur les notifications
+        if (l2capWanted && l2capOut == null && SystemClock.elapsedRealtime() - remoteStartedAt < 4000) {
+            handler.postDelayed(remoteRunnable, 100)
             return
         }
         // Mode notifications : on attend que l'image précédente soit partie. Canal rapide : une image peut attendre en réserve.

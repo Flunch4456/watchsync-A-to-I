@@ -93,6 +93,9 @@ final class HeartRateManager: NSObject, ObservableObject {
     @Published var screenImage: UIImage?
     /// 0 = arrêté, 1 = en cours, 2 = impossible (service d'accessibilité ou autorisation manquants)
     @Published var remoteState = 0
+    /// Vrai quand les images passent par le canal rapide.
+    @Published var fastChannel = false
+    @Published var channelError: String?
 
     let history = HistoryStore()
 
@@ -506,6 +509,7 @@ final class HeartRateManager: NSObject, ObservableObject {
         l2cap?.close()
         l2cap = nil
         l2capOpening = false
+        fastChannel = false
     }
 
     /// La montre annonce son canal rapide : on l'ouvre. Les images y arrivent bien plus vite que par notifications.
@@ -518,6 +522,7 @@ final class HeartRateManager: NSObject, ObservableObject {
     func remoteStart(side: Int, quality: Int) {
         lastSide = side
         lastQuality = quality
+        channelError = nil
         closeFrameChannel()
         write([0x90, 1, UInt8(clamping: side / 10), UInt8(clamping: quality), UInt8(remoteFormat)])
     }
@@ -787,10 +792,19 @@ extension HeartRateManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         l2capOpening = false
-        guard let channel, error == nil else { return }
+        if let error {
+            channelError = "Canal rapide refusé : \(error.localizedDescription)"
+            return
+        }
+        guard let channel else { return }
+        channelError = nil
         l2cap = FrameChannel(channel: channel,
                              onFrame: { [weak self] data in self?.showFrame(data) },
-                             onClose: { [weak self] in self?.l2cap = nil })
+                             onClose: { [weak self] in
+                                 self?.l2cap = nil
+                                 self?.fastChannel = false
+                             })
+        fastChannel = true
     }
 
     func peripheral(_ peripheral: CBPeripheral,
