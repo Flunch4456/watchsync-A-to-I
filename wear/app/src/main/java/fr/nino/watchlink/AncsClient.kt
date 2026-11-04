@@ -29,7 +29,7 @@ class AncsClient(private val context: Context, private val onStatus: (String) ->
 
     companion object {
         private const val TAG = "WatchLinkAncs"
-        private const val CHANNEL = "iphone_notifications"
+        private const val CHANNEL = "iphone_notifications_v2"
         private val SERVICE: UUID = UUID.fromString("7905F431-B5CE-4E99-A40F-4B1E122D00D0")
         private val NOTIFICATION_SOURCE: UUID = UUID.fromString("9FBF120D-6301-42D9-8C58-25E699A21DBD")
         private val CONTROL_POINT: UUID = UUID.fromString("69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9")
@@ -202,17 +202,24 @@ class AncsClient(private val context: Context, private val onStatus: (String) ->
         }
     }
 
-    /** Demande l'app (0), le titre (1, 64 car. max) et le message (3, 200 car. max). */
+    /** Demande l'app (0), le titre (1), le sous-titre (2, souvent l'objet) et le message (3). */
     private fun requestAttributes(uid: Long) {
         val b = byteArrayOf(
             0x00,
             (uid and 0xFF).toByte(), ((uid shr 8) and 0xFF).toByte(),
             ((uid shr 16) and 0xFF).toByte(), ((uid shr 24) and 0xFF).toByte(),
             0x00,
-            0x01, 64, 0,
-            0x03, 200.toByte(), 0
+            0x01, 100, 0,
+            0x02, 100, 0,
+            0x03, 0xF4.toByte(), 0x01 // 500 caractères
         )
         requests.addLast(b)
+        pump()
+    }
+
+    /** Demande le vrai nom d'une app (« WhatsApp ») à partir de son identifiant (« net.whatsapp.WhatsApp »). */
+    private fun requestAppName(appId: String) {
+        requests.addLast(byteArrayOf(0x01) + appId.toByteArray(Charsets.UTF_8) + byteArrayOf(0x00, 0x00))
         pump()
     }
 
@@ -234,55 +241,110 @@ class AncsClient(private val context: Context, private val onStatus: (String) ->
         }
     }
 
-    /** Réponse : commande (0), UID (4 octets), puis pour chaque attribut : id, longueur (2 octets), valeur. */
+    private val appNames = HashMap<String, String>()
+    private class Pending(val uid: Long, val title: String, val subtitle: String, val message: String)
+    private val waiting = HashMap<String, MutableList<Pending>>()
+
+    /**
+     * Deux types de réponses arrivent dans le même flux :
+     *  - 0 : notification = UID (4 octets), puis (id, longueur sur 2 octets, valeur) pour app, titre, sous-titre, message
+     *  - 1 : app = identifiant terminé par un octet nul, puis (id, longueur, valeur) pour le nom affiché
+     */
     private fun parseData() {
         while (true) {
             val b = buffer.toByteArray()
-            if (b.size < 5) return
-            if (b[0].toInt() != 0) {
-                buffer.reset()
-                return
+            if (b.isEmpty()) return
+            var i: Int
+            val consumed: Int
+            when (b[0].toInt()) {
+                0 -> {
+                    if (b.size < 5) return
+                    i = 5
+                    val attrs = HashMap<Int, String>()
+                    for (n in 0 until 4) {
+                        if (i + 3 > b.size) return
+                        val id = b[i].toInt() and 0xFF
+                        val len = (b[i + 1].toInt() and 0xFF) or ((b[i + 2].toInt() and 0xFF) shl 8)
+                        if (i + 3 + len > b.size) return
+                        attrs[id] = String(b, i + 3, len, Charsets.UTF_8)
+                        i += 3 + len
+                    }
+                    consumed = i
+                    onNotification(le32(b, 1), attrs[0] ?: "", attrs[1] ?: "", attrs[2] ?: "", attrs[3] ?: "")
+                }
+                1 -> {
+                    var end = 1
+                    while (end < b.size && b[end].toInt() != 0) end++
+                    if (end >= b.size) return
+                    val appId = String(b, 1, end - 1, Charsets.UTF_8)
+                    i = end + 1
+                    if (i + 3 > b.size) return
+                    val len = (b[i + 1].toInt() and 0xFF) or ((b[i + 2].toInt() and 0xFF) shl 8)
+                    if (i + 3 + len > b.size) return
+                    val name = String(b, i + 3, len, Charsets.UTF_8)
+                    i += 3 + len
+                    consumed = i
+                    onAppName(appId, name)
+                }
+                else -> {
+                    buffer.reset()
+                    return
+                }
             }
-            var i = 5
-            val attrs = HashMap<Int, String>()
-            var complete = true
-            for (n in 0 until 3) {
-                if (i + 3 > b.size) { complete = false; break }
-                val id = b[i].toInt() and 0xFF
-                val len = (b[i + 1].toInt() and 0xFF) or ((b[i + 2].toInt() and 0xFF) shl 8)
-                if (i + 3 + len > b.size) { complete = false; break }
-                attrs[id] = String(b, i + 3, len, Charsets.UTF_8)
-                i += 3 + len
-            }
-            if (!complete) return
-            post(le32(b, 1), attrs[0] ?: "", attrs[1] ?: "", attrs[3] ?: "")
-            val rest = b.copyOfRange(i, b.size)
+            val rest = b.copyOfRange(consumed, b.size)
             buffer.reset()
             buffer.write(rest)
         }
     }
 
-    private fun notificationId(uid: Long): Int = 20000 + (uid % 100000).toInt()
+    private fun onNotification(uid: Long, appId: String, title: String, subtitle: String, message: String) {
+        val known = appNames[appId]
+        if (known != null || appId.isEmpty()) {
+            post(uid, known ?: "iPhone", title, subtitle, message)
+            return
+        }
+        // Nom de l'app inconnu : on le demande, et on affiche quand il arrive (ou après 3 s au pire)
+        val list = waiting.getOrPut(appId) { mutableListOf() }
+        val first = list.isEmpty()
+        list.add(Pending(uid, title, subtitle, message))
+        if (first) {
+            requestAppName(appId)
+            handler.postDelayed({
+                if (!appNames.containsKey(appId)) onAppName(appId, fallbackName(appId))
+            }, 3000)
+        }
+    }
 
-    private fun appName(id: String): String = when (id.substringAfterLast('.')) {
+    private fun onAppName(appId: String, name: String) {
+        val shown = name.ifBlank { fallbackName(appId) }
+        appNames[appId] = shown
+        waiting.remove(appId)?.forEach { post(it.uid, shown, it.title, it.subtitle, it.message) }
+    }
+
+    private fun fallbackName(id: String): String = when (id.substringAfterLast('.')) {
         "MobileSMS" -> "Messages"
         "mobilephone" -> "Téléphone"
         "MobileMail" -> "Mail"
-        "whatsapp", "WhatsApp" -> "WhatsApp"
         "" -> "iPhone"
         else -> id.substringAfterLast('.')
     }
 
-    private fun post(uid: Long, app: String, title: String, text: String) {
+    private fun notificationId(uid: Long): Int = 20000 + (uid % 100000).toInt()
+
+    /** Titre = expéditeur ou titre ; texte = objet (sous-titre) puis contenu ; sous-texte = nom de l'app. */
+    private fun post(uid: Long, app: String, title: String, subtitle: String, message: String) {
         val nm = context.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL, "Notifications iPhone", NotificationManager.IMPORTANCE_DEFAULT)
+            NotificationChannel(CHANNEL, "Notifications iPhone", NotificationManager.IMPORTANCE_HIGH)
         )
+        val body = listOf(subtitle, message).filter { it.isNotBlank() }.joinToString("\n")
         val notification = Notification.Builder(context, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle(title.ifBlank { appName(app) })
-            .setContentText(text)
-            .setSubText(appName(app))
+            .setContentTitle(title.ifBlank { app })
+            .setContentText(body.lineSequence().firstOrNull() ?: "")
+            .setStyle(Notification.BigTextStyle().bigText(body))
+            .setSubText(app)
+            .setShowWhen(true)
             .setAutoCancel(true)
             .build()
         nm.notify(notificationId(uid), notification)
