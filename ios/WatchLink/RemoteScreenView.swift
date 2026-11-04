@@ -7,9 +7,9 @@ struct RemoteScreenView: View {
     @State private var noAnswer = false
 
     private static let presets: [(String, Int, Int)] = [
-        ("Rapide", 120, 40),
-        ("Équilibrée", 160, 50),
-        ("Nette", 220, 60)
+        ("Rapide", 240, 55),
+        ("Équilibrée", 320, 65),
+        ("Nette", 400, 80)
     ]
 
     var body: some View {
@@ -34,12 +34,12 @@ struct RemoteScreenView: View {
 
     private var footer: String {
         if noAnswer && manager.remoteState == 0 {
-            return "La montre n'a pas répondu. Vérifie que l'APK installé sur la montre est bien la version 0.8.1 ou plus récente (visible dans Contrôle de la montre), et que la montre est connectée."
+            return "La montre n'a pas répondu. Vérifie que l'APK installé sur la montre est bien la version 0.9.0 ou plus récente (visible dans Contrôle de la montre), et que la montre est connectée."
         }
         switch manager.remoteState {
-        case 1: return "Environ une image par seconde. L'écran de la montre reste allumé et l'affichage s'arrête seul au bout de 5 minutes."
+        case 1: return "Quelques images par seconde. L'écran de la montre reste allumé et l'affichage s'arrête seul au bout de 5 minutes."
         case 2: return "Impossible de démarrer : autorise d'abord la montre avec adb shell pm grant fr.nino.watchlink android.permission.WRITE_SECURE_SETTINGS, puis réessaie."
-        default: return "L'écran s'affiche ici en images fixes rafraîchies environ chaque seconde, ce n'est pas de la vidéo. Ça consomme de la batterie : arrête quand tu as fini."
+        default: return "L'écran s'affiche ici en images fixes rafraîchies plusieurs fois par seconde, ce n'est pas de la vidéo. « Nette » utilise la résolution complète de la montre. Ça consomme de la batterie : arrête quand tu as fini."
         }
     }
 
@@ -50,7 +50,7 @@ struct RemoteScreenView: View {
                 let height = width * image.size.height / Swift.max(image.size.width, 1)
                 Image(uiImage: image)
                     .resizable()
-                    .interpolation(.medium)
+                    .interpolation(.high)
                     .frame(width: width, height: height)
                     .clipShape(RoundedRectangle(cornerRadius: 24))
                     .gesture(

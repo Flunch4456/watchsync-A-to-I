@@ -49,7 +49,7 @@ for n, v in events.items():
 
 # 6. Taille minimale exigée par l'iPhone <= taille réellement envoyée par la montre
 sizes = {"EVENT_STEPS": 5, "EVENT_WORN": 2, "EVENT_PHONE_ALERT": 2, "EVENT_INFO": 13,
-         "EVENT_REMOTE": 2, "EVENT_MODEL": 2, "EVENT_VERSION": 2}
+         "EVENT_REMOTE": 2, "EVENT_MODEL": 2, "EVENT_VERSION": 2, "EVENT_PSM": 3}
 for n, size in sizes.items():
     v = events.get(n)
     if v is None:

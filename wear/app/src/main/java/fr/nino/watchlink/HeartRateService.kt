@@ -47,7 +47,12 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Base64
 import android.util.Log
+import java.io.IOException
+import java.io.OutputStream
 import java.time.LocalDate
+import java.util.concurrent.Executors
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
 import java.time.LocalTime
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -128,7 +133,7 @@ class HeartRateService : Service(), SensorEventListener {
         private const val CMD_DND = 0x82 // [0x82, 0/1] ne pas déranger
         private const val CMD_SAVER = 0x83 // [0x83, 0/1] économie d'énergie
         private const val CMD_INFO = 0x84 // demande l'état de la montre
-        private const val CMD_REMOTE = 0x90 // [0x90, 0/1, côté en dizaines de pixels, qualité JPEG]
+        private const val CMD_REMOTE = 0x90 // [0x90, 0/1, côté en dizaines de pixels, qualité, format 0 JPEG / 1 WebP]
         private const val CMD_TAP = 0x91 // [0x91, x(2), y(2)] position en fraction de l'écran (0 à 65535)
         private const val CMD_SWIPE = 0x92 // [0x92, x1(2), y1(2), x2(2), y2(2), durée ms (2)]
         private const val CMD_NAV = 0x93 // [0x93, 0 retour, 1 accueil, 2 récentes, 3 notifications]
@@ -140,6 +145,7 @@ class HeartRateService : Service(), SensorEventListener {
         private const val EVENT_INFO = 0x04 // état de la montre
         private const val EVENT_MODEL = 0x05 // nom du modèle
         private const val EVENT_VERSION = 0x07 // [0x07, version de l'app montre en texte]
+        private const val EVENT_PSM = 0x08 // [0x08, PSM hi, PSM lo] canal rapide L2CAP pour les images
         private const val EVENT_REMOTE = 0x06 // [0x06, 0 arrêté, 1 en cours, 2 accessibilité indisponible]
         private const val EVENT_PHONE_ALERT = 0x03 // [0x03, 1 = sonner, 2 = vibrer, 0 = annuler]
 
@@ -805,11 +811,22 @@ class HeartRateService : Service(), SensorEventListener {
 
     private var remoteOn = false
     private var remoteDevice: BluetoothDevice? = null
-    private var remoteSide = 160
-    private var remoteQuality = 45
+    private var remoteSide = 320
+    private var remoteQuality = 65
+    private var remoteWebp = true
     private var remoteWaitTicks = 0
     private var frameId = 0
     private var screenLock: PowerManager.WakeLock? = null
+    private var lastFrame: ByteArray? = null
+
+    // Canal rapide (L2CAP) : beaucoup plus de débit que les notifications Bluetooth
+    private var l2capServer: BluetoothServerSocket? = null
+    private var l2capSocket: BluetoothSocket? = null
+    @Volatile private var l2capOut: OutputStream? = null
+    private val frameLock = Any()
+    private var pendingFrame: ByteArray? = null
+    private var sending = false
+    private val sendExecutor = Executors.newSingleThreadExecutor()
 
     private fun fraction(b: ByteArray, i: Int): Float =
         (((b[i].toInt() and 0xFF) shl 8) or (b[i + 1].toInt() and 0xFF)) / 65535f
@@ -837,12 +854,58 @@ class HeartRateService : Service(), SensorEventListener {
     private val remoteRunnable: Runnable = Runnable { remoteTick() }
     private val remoteStopRunnable: Runnable = Runnable { stopRemote() }
 
-    private fun startRemote(device: BluetoothDevice, side: Int, quality: Int) {
+    /** Ouvre un canal L2CAP et renvoie son numéro (PSM), ou 0 s'il est indisponible : on garde alors les notifications. */
+    private fun startL2cap(): Int {
+        closeL2cap()
+        return try {
+            val server = btManager.adapter.listenUsingInsecureL2capChannel()
+            l2capServer = server
+            val psm = server.psm
+            Thread {
+                try {
+                    val socket = server.accept()
+                    l2capSocket = socket
+                    l2capOut = socket.outputStream
+                    handler.post { status("Canal rapide connecté") }
+                } catch (e: Exception) {
+                    Log.w(TAG, "L2CAP: $e")
+                }
+            }.start()
+            psm
+        } catch (e: Exception) {
+            Log.w(TAG, "L2CAP indisponible: $e")
+            0
+        }
+    }
+
+    private fun closeL2cap() {
+        l2capOut = null
+        try {
+            l2capSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "close socket: $e")
+        }
+        try {
+            l2capServer?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "close server: $e")
+        }
+        l2capSocket = null
+        l2capServer = null
+        synchronized(frameLock) {
+            pendingFrame = null
+            sending = false
+        }
+    }
+
+    private fun startRemote(device: BluetoothDevice, side: Int, quality: Int, webp: Boolean) {
         stopRemote()
         remoteDevice = device
-        remoteSide = side.coerceIn(80, 300)
-        remoteQuality = quality.coerceIn(20, 80)
+        remoteSide = side.coerceIn(80, 600)
+        remoteQuality = quality.coerceIn(20, 95)
+        remoteWebp = webp
         remoteWaitTicks = 0
+        lastFrame = null
         if (!enableRemoteAccessibility()) {
             status("Écran à distance : autorisation WRITE_SECURE_SETTINGS manquante")
             sendEvent(byteArrayOf(EVENT_REMOTE.toByte(), 2))
@@ -860,6 +923,13 @@ class HeartRateService : Service(), SensorEventListener {
         remoteOn = true
         status("Écran à distance démarré")
         sendEvent(byteArrayOf(EVENT_REMOTE.toByte(), 1))
+        // Le numéro du canal rapide part un peu après, pour ne pas collisionner avec l'événement précédent
+        val psm = startL2cap()
+        if (psm > 0) {
+            val packet = byteArrayOf(EVENT_PSM.toByte(), ((psm shr 8) and 0xFF).toByte(), (psm and 0xFF).toByte())
+            handler.postDelayed({ if (remoteOn) sendEvent(packet) }, 300)
+            handler.postDelayed({ if (remoteOn && l2capOut == null) sendEvent(packet) }, 2500)
+        }
         // Arrêt automatique au bout de 5 minutes pour protéger la batterie
         handler.removeCallbacks(remoteStopRunnable)
         handler.postDelayed(remoteStopRunnable, 5 * 60 * 1000L)
@@ -871,6 +941,7 @@ class HeartRateService : Service(), SensorEventListener {
         remoteOn = false
         handler.removeCallbacks(remoteRunnable)
         handler.removeCallbacks(remoteStopRunnable)
+        closeL2cap()
         screenLock?.let { if (it.isHeld) it.release() }
         screenLock = null
         if (wasOn) {
@@ -894,21 +965,79 @@ class HeartRateService : Service(), SensorEventListener {
             }
             return
         }
-        // On attend que l'image précédente soit partie en entier
-        if (!syncQueue.isEmpty()) {
-            handler.postDelayed(remoteRunnable, 150)
+        // Mode notifications : on attend que l'image précédente soit partie. Canal rapide : une image peut attendre en réserve.
+        val waiting = if (l2capOut != null) synchronized(frameLock) { pendingFrame != null } else !syncQueue.isEmpty()
+        if (waiting) {
+            handler.postDelayed(remoteRunnable, 40)
             return
         }
-        service.capture(remoteSide, remoteQuality) { jpeg ->
+        service.capture(remoteSide, remoteQuality, remoteWebp) { data ->
             handler.post {
                 if (!remoteOn) return@post
-                if (jpeg != null) enqueueFrame(jpeg)
-                handler.postDelayed(remoteRunnable, 250)
+                val previous = lastFrame
+                // Écran inchangé : rien à envoyer
+                if (data != null && (previous == null || !data.contentEquals(previous))) {
+                    lastFrame = data
+                    deliverFrame(data)
+                }
+                handler.postDelayed(remoteRunnable, if (data == null) 300L else 20L)
             }
         }
     }
 
-    /** Découpe l'image en paquets : [0x10, numéro d'image, numéro de paquet (2), nombre de paquets (2), données]. */
+    private fun deliverFrame(data: ByteArray) {
+        if (l2capOut == null) {
+            enqueueFrame(data)
+            return
+        }
+        var startNow = false
+        synchronized(frameLock) {
+            if (sending) {
+                pendingFrame = data // la plus récente remplace celle qui attendait
+            } else {
+                sending = true
+                startNow = true
+            }
+        }
+        if (startNow) sendExecutor.execute { sendLoop(data) }
+    }
+
+    /** Envoie les images sur le canal rapide : [taille sur 4 octets][image]. Tourne sur son propre thread. */
+    private fun sendLoop(first: ByteArray) {
+        var frame: ByteArray? = first
+        while (true) {
+            val current = frame ?: break
+            var ok = true
+            val out = l2capOut
+            if (out == null) {
+                ok = false
+            } else {
+                try {
+                    val n = current.size
+                    out.write(
+                        byteArrayOf(
+                            ((n shr 24) and 0xFF).toByte(), ((n shr 16) and 0xFF).toByte(),
+                            ((n shr 8) and 0xFF).toByte(), (n and 0xFF).toByte()
+                        )
+                    )
+                    out.write(current)
+                    out.flush()
+                } catch (e: IOException) {
+                    ok = false
+                    handler.post { closeL2cap() }
+                }
+            }
+            var following: ByteArray? = null
+            synchronized(frameLock) {
+                if (ok) following = pendingFrame
+                pendingFrame = null
+                if (following == null) sending = false
+            }
+            frame = following
+        }
+    }
+
+    /** Mode de secours : découpe l'image en paquets [0x10, numéro d'image, numéro de paquet (2), nombre de paquets (2), données]. */
     private fun enqueueFrame(jpeg: ByteArray) {
         val device = remoteDevice ?: return
         syncDevice = device
@@ -1533,7 +1662,12 @@ class HeartRateService : Service(), SensorEventListener {
             CMD_INFO -> sendDeviceInfo()
             CMD_REMOTE -> if (value.size >= 4) {
                 if (value[1].toInt() != 0) {
-                    startRemote(device, (value[2].toInt() and 0xFF) * 10, value[3].toInt() and 0xFF)
+                    startRemote(
+                        device,
+                        (value[2].toInt() and 0xFF) * 10,
+                        value[3].toInt() and 0xFF,
+                        value.size >= 5 && value[4].toInt() != 0
+                    )
                 } else {
                     stopRemote()
                 }

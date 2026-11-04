@@ -7,6 +7,12 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Version 0.9.0 : écran à distance plus rapide et plus net
+
+- Les images passent par un canal Bluetooth dédié (L2CAP), bien plus rapide que les notifications. Si le canal ne s'ouvre pas, l'app revient toute seule à l'ancien mode.
+- Images en WebP (plus nettes à poids égal), jusqu'à la résolution complète de la montre (réglage « Nette »), et pas d'envoi quand l'écran n'a pas changé.
+- Retour arrière : branche `stable-v0.8.1`.
+
 ## Version 0.8.1 : correctif
 
 - Corrige les commandes de la montre à partir de `0x80` (état de la montre, luminosité, durée d'écran, ne pas déranger, économie d'énergie, écran à distance), ignorées à cause d'un octet lu en signé.

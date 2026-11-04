@@ -7,7 +7,9 @@ import android.graphics.Bitmap
 import android.graphics.Path
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
+import android.os.Build
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
 
 /**
  * Permet à l'app iPhone de voir l'écran de la montre et de la manipuler :
@@ -19,6 +21,8 @@ class RemoteAccessibilityService : AccessibilityService() {
     companion object {
         @Volatile var instance: RemoteAccessibilityService? = null
     }
+
+    private val worker = Executors.newSingleThreadExecutor()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -39,12 +43,15 @@ class RemoteAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() = Unit
 
-    /** Capture l'écran, le réduit à `maxSide` pixels de côté et le compresse en JPEG. `done(null)` en cas d'échec. */
-    fun capture(maxSide: Int, quality: Int, done: (ByteArray?) -> Unit) {
+    /**
+     * Capture l'écran, le réduit à `maxSide` pixels de côté (sans l'agrandir) et le compresse en WebP ou en JPEG.
+     * `done` est appelé sur un thread de travail, avec null en cas d'échec.
+     */
+    fun capture(maxSide: Int, quality: Int, webp: Boolean, done: (ByteArray?) -> Unit) {
         try {
             takeScreenshot(
                 Display.DEFAULT_DISPLAY,
-                mainExecutor,
+                worker,
                 object : AccessibilityService.TakeScreenshotCallback {
                     override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
                         try {
@@ -58,15 +65,20 @@ class RemoteAccessibilityService : AccessibilityService() {
                             val soft = hardware.copy(Bitmap.Config.ARGB_8888, false)
                             hardware.recycle()
                             buffer.close()
-                            val scale = maxSide.toFloat() / maxOf(soft.width, soft.height)
-                            val small = Bitmap.createScaledBitmap(
+                            val scale = minOf(1f, maxSide.toFloat() / maxOf(soft.width, soft.height))
+                            val small = if (scale >= 1f) soft else Bitmap.createScaledBitmap(
                                 soft,
                                 (soft.width * scale).toInt().coerceAtLeast(1),
                                 (soft.height * scale).toInt().coerceAtLeast(1),
                                 true
                             )
+                            val format = if (webp && Build.VERSION.SDK_INT >= 30) {
+                                Bitmap.CompressFormat.WEBP_LOSSY
+                            } else {
+                                Bitmap.CompressFormat.JPEG
+                            }
                             val out = ByteArrayOutputStream()
-                            small.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 90), out)
+                            small.compress(format, quality.coerceIn(10, 95), out)
                             done(out.toByteArray())
                         } catch (e: Exception) {
                             done(null)

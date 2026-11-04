@@ -56,7 +56,7 @@ struct WatchControlView: View {
                 if !manager.authenticated {
                     Text("Montre non connectée.").foregroundStyle(.secondary)
                 } else if waited {
-                    Text("La montre ne répond pas à cette demande. Vérifie que l'APK installé sur la montre est bien la version 0.8.1 ou plus récente, puis touche Actualiser.")
+                    Text("La montre ne répond pas à cette demande. Vérifie que l'APK installé sur la montre est bien la version 0.9.0 ou plus récente, puis touche Actualiser.")
                         .foregroundStyle(.orange)
                 } else {
                     Text("Lecture de l'état de la montre…").foregroundStyle(.secondary)

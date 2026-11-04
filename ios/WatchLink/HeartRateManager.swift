@@ -130,6 +130,12 @@ final class HeartRateManager: NSObject, ObservableObject {
     private var frameID = -1
     private var frameTotal = 0
     private var frameChunks: [Int: Data] = [:]
+    private var l2cap: FrameChannel?
+    private var l2capOpening = false
+    private var remoteFormat = 1          // 1 = WebP, 0 = JPEG (repli si l'iPhone n'arrive pas à décoder le WebP)
+    private var lastSide = 320
+    private var lastQuality = 65
+    private var decodeFailures = 0
     private var alertReset: DispatchWorkItem?
     private var lastPhoneAlert = Date.distantPast
 
@@ -229,6 +235,7 @@ final class HeartRateManager: NSObject, ObservableObject {
         watchInfo = nil
         screenImage = nil
         remoteState = 0
+        closeFrameChannel()
         attempt = .none
         pendingCode = nil
         watchAlert = .none
@@ -476,15 +483,48 @@ final class HeartRateManager: NSObject, ObservableObject {
             jpeg.append(chunk)
         }
         frameChunks = [:]
-        if let image = UIImage(data: jpeg) { screenImage = image }
+        showFrame(jpeg)
+    }
+
+    /// Affiche une image reçue (par le canal rapide ou par les notifications).
+    private func showFrame(_ data: Data) {
+        if let image = UIImage(data: data) {
+            screenImage = image
+            decodeFailures = 0
+        } else {
+            decodeFailures += 1
+            // Si le WebP ne peut pas être lu, on repasse la montre en JPEG
+            if decodeFailures >= 2 && remoteFormat == 1 {
+                remoteFormat = 0
+                decodeFailures = 0
+                remoteStart(side: lastSide, quality: lastQuality)
+            }
+        }
+    }
+
+    private func closeFrameChannel() {
+        l2cap?.close()
+        l2cap = nil
+        l2capOpening = false
+    }
+
+    /// La montre annonce son canal rapide : on l'ouvre. Les images y arrivent bien plus vite que par notifications.
+    private func openFrameChannel(psm: UInt16) {
+        guard let p = current, l2cap == nil, !l2capOpening else { return }
+        l2capOpening = true
+        p.openL2CAPChannel(CBL2CAPPSM(psm))
     }
 
     func remoteStart(side: Int, quality: Int) {
-        write([0x90, 1, UInt8(clamping: side / 10), UInt8(clamping: quality)])
+        lastSide = side
+        lastQuality = quality
+        closeFrameChannel()
+        write([0x90, 1, UInt8(clamping: side / 10), UInt8(clamping: quality), UInt8(remoteFormat)])
     }
 
     func remoteStop() {
-        write([0x90, 0, 0, 0])
+        write([0x90, 0, 0, 0, 0])
+        closeFrameChannel()
         remoteState = 0
     }
 
@@ -745,6 +785,14 @@ extension HeartRateManager: CBPeripheralDelegate {
         }
     }
 
+    func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        l2capOpening = false
+        guard let channel, error == nil else { return }
+        l2cap = FrameChannel(channel: channel,
+                             onFrame: { [weak self] data in self?.showFrame(data) },
+                             onClose: { [weak self] in self?.l2cap = nil })
+    }
+
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
@@ -796,6 +844,8 @@ extension HeartRateManager: CBPeripheralDelegate {
                     brightness: Int(bytes[10]),
                     dnd: bytes[11] != 0,
                     saver: bytes[12] != 0)
+            } else if kind == 0x08, bytes.count >= 3 {
+                openFrameChannel(psm: UInt16(bytes[1]) << 8 | UInt16(bytes[2]))
             } else if kind == 0x07, bytes.count >= 2 {
                 watchVersion = String(decoding: bytes[1...], as: UTF8.self)
             } else if kind == 0x06, bytes.count >= 2 {
@@ -917,5 +967,84 @@ final class PhoneFinder {
         let center = UNUserNotificationCenter.current()
         center.removePendingNotificationRequests(withIdentifiers: ids)
         center.removeDeliveredNotifications(withIdentifiers: ids)
+    }
+}
+
+// MARK: - Canal rapide (L2CAP) pour les images de l'écran à distance
+
+/// Lit les images envoyées par la montre : chaque image est précédée de sa taille sur 4 octets.
+final class FrameChannel: NSObject, StreamDelegate {
+    private let channel: CBL2CAPChannel
+    private var buffer = Data()
+    private let onFrame: (Data) -> Void
+    private let onClose: () -> Void
+    private var closed = false
+
+    init(channel: CBL2CAPChannel, onFrame: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+        self.channel = channel
+        self.onFrame = onFrame
+        self.onClose = onClose
+        super.init()
+        for stream in streams {
+            stream.delegate = self
+            stream.schedule(in: .main, forMode: .default)
+            stream.open()
+        }
+    }
+
+    private var streams: [Stream] {
+        [channel.inputStream, channel.outputStream]
+    }
+
+    func close() {
+        guard !closed else { return }
+        closed = true
+        for stream in streams {
+            stream.delegate = nil
+            stream.remove(from: .main, forMode: .default)
+            stream.close()
+        }
+    }
+
+    func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
+        switch eventCode {
+        case .hasBytesAvailable:
+            readAvailable()
+        case .endEncountered, .errorOccurred:
+            close()
+            onClose()
+        default:
+            break
+        }
+    }
+
+    private func readAvailable() {
+        var chunk = [UInt8](repeating: 0, count: 16384)
+        while channel.inputStream.hasBytesAvailable {
+            let n = channel.inputStream.read(&chunk, maxLength: chunk.count)
+            if n <= 0 { break }
+            buffer.append(chunk, count: n)
+        }
+        parse()
+    }
+
+    private func parse() {
+        while buffer.count >= 4 {
+            let s = buffer.startIndex
+            let b0 = Int(buffer[s]) << 24
+            let b1 = Int(buffer[s + 1]) << 16
+            let b2 = Int(buffer[s + 2]) << 8
+            let b3 = Int(buffer[s + 3])
+            let length = b0 | b1 | b2 | b3
+            if length <= 0 || length > 4_000_000 {
+                close()
+                onClose()
+                return
+            }
+            guard buffer.count >= 4 + length else { return }
+            let frame = buffer.subdata(in: (s + 4)..<(s + 4 + length))
+            buffer.removeSubrange(s..<(s + 4 + length))
+            onFrame(frame)
+        }
     }
 }
