@@ -128,6 +128,10 @@ class HeartRateService : Service(), SensorEventListener {
         private const val CMD_DND = 0x82 // [0x82, 0/1] ne pas déranger
         private const val CMD_SAVER = 0x83 // [0x83, 0/1] économie d'énergie
         private const val CMD_INFO = 0x84 // demande l'état de la montre
+        private const val CMD_REMOTE = 0x90 // [0x90, 0/1, côté en dizaines de pixels, qualité JPEG]
+        private const val CMD_TAP = 0x91 // [0x91, x(2), y(2)] position en fraction de l'écran (0 à 65535)
+        private const val CMD_SWIPE = 0x92 // [0x92, x1(2), y1(2), x2(2), y2(2), durée ms (2)]
+        private const val CMD_NAV = 0x93 // [0x93, 0 retour, 1 accueil, 2 récentes, 3 notifications]
         private const val CMD_SYNC_REQUEST = 0x50 // [0x50, 4 octets] envoie tout ce qui est plus récent (secondes)
 
         // Événements (montre vers iPhone) : premier octet de la notification
@@ -135,12 +139,14 @@ class HeartRateService : Service(), SensorEventListener {
         private const val EVENT_WORN = 0x02 // [0x02, 1 = portée, 0 = retirée]
         private const val EVENT_INFO = 0x04 // état de la montre
         private const val EVENT_MODEL = 0x05 // nom du modèle
+        private const val EVENT_REMOTE = 0x06 // [0x06, 0 arrêté, 1 en cours, 2 accessibilité indisponible]
         private const val EVENT_PHONE_ALERT = 0x03 // [0x03, 1 = sonner, 2 = vibrer, 0 = annuler]
 
         // Synchronisation : types de paquets
         private const val SYNC_HEART_RATE = 0x01
         private const val SYNC_BATTERY = 0x02
         private const val SYNC_STEPS = 0x03
+        private const val SYNC_FRAME = 0x10 // image de l'écran à distance
         private const val SYNC_END = 0xFF
 
         // Liaison : réponses
@@ -263,6 +269,7 @@ class HeartRateService : Service(), SensorEventListener {
         running = false
         handler.removeCallbacksAndMessages(null)
         stopRing()
+        stopRemote()
         endPairing()
         sensorManager.unregisterListener(this)
         try {
@@ -792,6 +799,137 @@ class HeartRateService : Service(), SensorEventListener {
         }
     }
 
+    // --- Écran de la montre à distance ------------------------------------------------
+    // Une image JPEG réduite part toutes les secondes environ, par la caractéristique de synchronisation.
+
+    private var remoteOn = false
+    private var remoteDevice: BluetoothDevice? = null
+    private var remoteSide = 160
+    private var remoteQuality = 45
+    private var remoteWaitTicks = 0
+    private var frameId = 0
+    private var screenLock: PowerManager.WakeLock? = null
+
+    private fun fraction(b: ByteArray, i: Int): Float =
+        (((b[i].toInt() and 0xFF) shl 8) or (b[i + 1].toInt() and 0xFF)) / 65535f
+
+    /** Active le service d'accessibilité par les réglages sécurisés (autorisation WRITE_SECURE_SETTINGS donnée par ADB). */
+    private fun enableRemoteAccessibility(): Boolean {
+        if (RemoteAccessibilityService.instance != null) return true
+        return try {
+            val name = "$packageName/${RemoteAccessibilityService::class.java.name}"
+            val current = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+            if (!current.split(':').contains(name)) {
+                Settings.Secure.putString(
+                    contentResolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                    if (current.isEmpty()) name else "$current:$name"
+                )
+            }
+            Settings.Secure.putInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private val remoteRunnable: Runnable = Runnable { remoteTick() }
+    private val remoteStopRunnable: Runnable = Runnable { stopRemote() }
+
+    private fun startRemote(device: BluetoothDevice, side: Int, quality: Int) {
+        stopRemote()
+        remoteDevice = device
+        remoteSide = side.coerceIn(80, 300)
+        remoteQuality = quality.coerceIn(20, 80)
+        remoteWaitTicks = 0
+        if (!enableRemoteAccessibility()) {
+            status("Écran à distance : autorisation WRITE_SECURE_SETTINGS manquante")
+            sendEvent(byteArrayOf(EVENT_REMOTE.toByte(), 2))
+            return
+        }
+        try {
+            @Suppress("DEPRECATION")
+            screenLock = (getSystemService(Context.POWER_SERVICE) as PowerManager).newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "watchlink:remote"
+            ).also { it.acquire(5 * 60 * 1000L) }
+        } catch (e: Exception) {
+            Log.w(TAG, "écran allumé: $e")
+        }
+        remoteOn = true
+        status("Écran à distance démarré")
+        sendEvent(byteArrayOf(EVENT_REMOTE.toByte(), 1))
+        // Arrêt automatique au bout de 5 minutes pour protéger la batterie
+        handler.removeCallbacks(remoteStopRunnable)
+        handler.postDelayed(remoteStopRunnable, 5 * 60 * 1000L)
+        handler.post(remoteRunnable)
+    }
+
+    private fun stopRemote() {
+        val wasOn = remoteOn
+        remoteOn = false
+        handler.removeCallbacks(remoteRunnable)
+        handler.removeCallbacks(remoteStopRunnable)
+        screenLock?.let { if (it.isHeld) it.release() }
+        screenLock = null
+        if (wasOn) {
+            status("Écran à distance arrêté")
+            sendEvent(byteArrayOf(EVENT_REMOTE.toByte(), 0))
+        }
+        remoteDevice = null
+    }
+
+    private fun remoteTick() {
+        if (!remoteOn) return
+        val service = RemoteAccessibilityService.instance
+        if (service == null) {
+            // Le service d'accessibilité met une ou deux secondes à démarrer après son activation
+            remoteWaitTicks++
+            if (remoteWaitTicks > 25) {
+                stopRemote()
+                sendEvent(byteArrayOf(EVENT_REMOTE.toByte(), 2))
+            } else {
+                handler.postDelayed(remoteRunnable, 400)
+            }
+            return
+        }
+        // On attend que l'image précédente soit partie en entier
+        if (!syncQueue.isEmpty()) {
+            handler.postDelayed(remoteRunnable, 150)
+            return
+        }
+        service.capture(remoteSide, remoteQuality) { jpeg ->
+            handler.post {
+                if (!remoteOn) return@post
+                if (jpeg != null) enqueueFrame(jpeg)
+                handler.postDelayed(remoteRunnable, 250)
+            }
+        }
+    }
+
+    /** Découpe l'image en paquets : [0x10, numéro d'image, numéro de paquet (2), nombre de paquets (2), données]. */
+    private fun enqueueFrame(jpeg: ByteArray) {
+        val device = remoteDevice ?: return
+        syncDevice = device
+        val payload = (currentMtu - 3 - 6).coerceIn(14, 180)
+        val total = (jpeg.size + payload - 1) / payload
+        frameId = (frameId + 1) and 0xFF
+        for (i in 0 until total) {
+            val from = i * payload
+            val to = minOf(jpeg.size, from + payload)
+            val packet = ByteArray(6 + to - from)
+            packet[0] = SYNC_FRAME.toByte()
+            packet[1] = frameId.toByte()
+            packet[2] = ((i shr 8) and 0xFF).toByte()
+            packet[3] = (i and 0xFF).toByte()
+            packet[4] = ((total shr 8) and 0xFF).toByte()
+            packet[5] = (total and 0xFF).toByte()
+            System.arraycopy(jpeg, from, packet, 6, to - from)
+            syncQueue.addLast(packet)
+        }
+        pumpSync()
+    }
+
     // --- Contrôle de la montre depuis l'iPhone -------------------------------------------
     // Ces réglages système exigent une autorisation donnée une fois par ADB (voir le README).
 
@@ -1183,6 +1321,7 @@ class HeartRateService : Service(), SensorEventListener {
                 authorized.remove(device)
                 authNonces.remove(device)
                 ancs?.stop()
+                if (remoteDevice == device) stopRemote()
                 if (syncDevice == device) {
                     syncDevice = null
                     syncQueue.clear()
@@ -1382,6 +1521,28 @@ class HeartRateService : Service(), SensorEventListener {
             CMD_DND -> if (value.size >= 2) setDnd(value[1].toInt() != 0)
             CMD_SAVER -> if (value.size >= 2) setPowerSaver(value[1].toInt() != 0)
             CMD_INFO -> sendDeviceInfo()
+            CMD_REMOTE -> if (value.size >= 4) {
+                if (value[1].toInt() != 0) {
+                    startRemote(device, (value[2].toInt() and 0xFF) * 10, value[3].toInt() and 0xFF)
+                } else {
+                    stopRemote()
+                }
+            }
+            CMD_TAP -> if (value.size >= 5) {
+                val m = resources.displayMetrics
+                RemoteAccessibilityService.instance?.tap(
+                    fraction(value, 1) * m.widthPixels, fraction(value, 3) * m.heightPixels
+                )
+            }
+            CMD_SWIPE -> if (value.size >= 11) {
+                val m = resources.displayMetrics
+                RemoteAccessibilityService.instance?.swipe(
+                    fraction(value, 1) * m.widthPixels, fraction(value, 3) * m.heightPixels,
+                    fraction(value, 5) * m.widthPixels, fraction(value, 7) * m.heightPixels,
+                    (((value[9].toInt() and 0xFF) shl 8) or (value[10].toInt() and 0xFF)).toLong()
+                )
+            }
+            CMD_NAV -> if (value.size >= 2) RemoteAccessibilityService.instance?.navigate(value[1].toInt())
             CMD_SYNC_REQUEST -> if (value.size >= 5) {
                 var since = 0L
                 for (k in 0 until 4) {

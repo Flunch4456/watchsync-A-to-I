@@ -67,3 +67,33 @@ jobs:
         with:
           name: WatchLink-iphone-ipa
           path: ios/WatchLink.ipa
+
+  release:
+    name: Publier la release
+    needs: [android, ios]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Créer ou mettre à jour la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(grep -o 'MARKETING_VERSION: "[^"]*"' ios/project.yml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          cp dist/WatchLink-montre-apk/app-debug.apk "WatchLink-montre-$VERSION.apk"
+          cp dist/WatchLink-iphone-ipa/WatchLink.ipa "WatchLink-iphone-$VERSION.ipa"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" "WatchLink-montre-$VERSION.apk" "WatchLink-iphone-$VERSION.ipa" --clobber
+          else
+            gh release create "v$VERSION" "WatchLink-montre-$VERSION.apk" "WatchLink-iphone-$VERSION.ipa" \
+              --target "$GITHUB_SHA" \
+              --title "WatchLink $VERSION" \
+              --notes "APK pour la montre (Wear OS) et IPA non signé pour l'iPhone (à installer avec SideStore)."
+          fi

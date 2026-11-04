@@ -7,6 +7,12 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Nouveautés de la version 0.8.0
+
+- **Écran de la montre à distance** (Réglages > Écran de la montre à distance) : l'écran de la montre s'affiche sur l'iPhone (une image par seconde environ, pas de la vidéo). Touche pour toucher, glisse pour faire défiler, boutons Retour / Accueil / Récentes. Arrêt automatique au bout de 5 minutes. Utilise un service d'accessibilité que l'app active elle-même grâce à l'autorisation `WRITE_SECURE_SETTINGS`.
+- **Releases GitHub** : à chaque version, l'APK et l'IPA sont joints dans l'onglet Releases du dépôt.
+- Retour arrière : branche `stable-v0.7.1`.
+
 ## Nouveautés de la version 0.7.0
 
 - **Contrôle de la montre** (Réglages > Contrôle de la montre) : état détaillé (modèle, Android, température de batterie, stockage, temps depuis le démarrage), luminosité, durée d'écran allumé, ne pas déranger, économie d'énergie.

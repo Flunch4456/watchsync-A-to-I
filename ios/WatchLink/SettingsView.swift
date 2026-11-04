@@ -139,6 +139,11 @@ struct SettingsView: View {
             } label: {
                 Label("Contrôle de la montre", systemImage: "applewatch.watchface")
             }
+            NavigationLink {
+                RemoteScreenView(manager: manager)
+            } label: {
+                Label("Écran de la montre à distance", systemImage: "rectangle.on.rectangle")
+            }
         } footer: {
             Text("État détaillé de la montre, luminosité, durée d'écran, ne pas déranger, économie d'énergie.")
         }

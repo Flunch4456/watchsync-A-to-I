@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="remote_description">Permet à l\'app WatchLink de l\'iPhone d\'afficher et de commander l\'écran de la montre.</string>
+    <string name="remote_label">WatchLink écran à distance</string>
+</resources>

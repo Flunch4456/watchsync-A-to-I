@@ -1,4 +1,5 @@
 import AVFoundation
+import UIKit
 import AudioToolbox
 import CoreBluetooth
 import CryptoKit
@@ -88,6 +89,9 @@ final class HeartRateManager: NSObject, ObservableObject {
     @Published var syncing = false
     @Published var watchInfo: WatchInfo?
     @Published var watchModel: String?
+    @Published var screenImage: UIImage?
+    /// 0 = arrêté, 1 = en cours, 2 = impossible (service d'accessibilité ou autorisation manquants)
+    @Published var remoteState = 0
 
     let history = HistoryStore()
 
@@ -122,6 +126,9 @@ final class HeartRateManager: NSObject, ObservableObject {
     private var syncBattery: [(Int, Int)] = []
     private var syncSteps: [(Int, Int)] = []
     private let finder = PhoneFinder()
+    private var frameID = -1
+    private var frameTotal = 0
+    private var frameChunks: [Int: Data] = [:]
     private var alertReset: DispatchWorkItem?
     private var lastPhoneAlert = Date.distantPast
 
@@ -219,6 +226,8 @@ final class HeartRateManager: NSObject, ObservableObject {
         needsCode = false
         syncing = false
         watchInfo = nil
+        screenImage = nil
+        remoteState = 0
         attempt = .none
         pendingCode = nil
         watchAlert = .none
@@ -430,6 +439,8 @@ final class HeartRateManager: NSObject, ObservableObject {
                 syncSteps.append((Self.le32(b, at: i), Self.le32(b, at: i + 4)))
                 i += 8
             }
+        case 0x10:
+            handleFrame(b)
         case 0xFF:
             let count = history.mergeSync(heart: syncHeart, battery: syncBattery,
                                           steps: syncSteps, cutoff: syncCutoff)
@@ -441,6 +452,67 @@ final class HeartRateManager: NSObject, ObservableObject {
         default:
             break
         }
+    }
+
+    // MARK: - Écran de la montre à distance
+
+    /// Paquet d'image : [0x10, numéro d'image, numéro de paquet (2), nombre de paquets (2), données JPEG].
+    private func handleFrame(_ b: [UInt8]) {
+        guard b.count > 6 else { return }
+        let id = Int(b[1])
+        let index = Int(b[2]) << 8 | Int(b[3])
+        let total = Int(b[4]) << 8 | Int(b[5])
+        if id != frameID {
+            frameID = id
+            frameTotal = total
+            frameChunks = [:]
+        }
+        frameChunks[index] = Data(b[6...])
+        guard frameChunks.count == frameTotal else { return }
+        var jpeg = Data()
+        for i in 0..<frameTotal {
+            guard let chunk = frameChunks[i] else { return }
+            jpeg.append(chunk)
+        }
+        frameChunks = [:]
+        if let image = UIImage(data: jpeg) { screenImage = image }
+    }
+
+    func remoteStart(side: Int, quality: Int) {
+        write([0x90, 1, UInt8(clamping: side / 10), UInt8(clamping: quality)])
+    }
+
+    func remoteStop() {
+        write([0x90, 0, 0, 0])
+        remoteState = 0
+    }
+
+    private func fraction(_ v: Double) -> [UInt8] {
+        let n = UInt16(Swift.max(0, Swift.min(1, v)) * 65535)
+        return [UInt8(n >> 8), UInt8(n & 0xFF)]
+    }
+
+    func remoteTap(x: Double, y: Double) {
+        var bytes: [UInt8] = [0x91]
+        bytes += fraction(x)
+        bytes += fraction(y)
+        write(bytes)
+    }
+
+    func remoteSwipe(from a: (Double, Double), to b: (Double, Double), durationMs: Int) {
+        let d = UInt16(clamping: durationMs)
+        var bytes: [UInt8] = [0x92]
+        bytes += fraction(a.0)
+        bytes += fraction(a.1)
+        bytes += fraction(b.0)
+        bytes += fraction(b.1)
+        bytes += [UInt8(d >> 8), UInt8(d & 0xFF)]
+        write(bytes)
+    }
+
+    /// 0 = retour, 1 = accueil, 2 = applications récentes, 3 = notifications.
+    func remoteNavigate(_ kind: UInt8) {
+        write([0x93, kind])
     }
 
     // MARK: - Montre retirée
@@ -723,6 +795,9 @@ extension HeartRateManager: CBPeripheralDelegate {
                     brightness: Int(bytes[10]),
                     dnd: bytes[11] != 0,
                     saver: bytes[12] != 0)
+            } else if kind == 0x06, bytes.count >= 2 {
+                remoteState = Int(bytes[1])
+                if bytes[1] == 0 { screenImage = nil }
             } else if kind == 0x05, bytes.count >= 2 {
                 watchModel = String(decoding: bytes[1...], as: UTF8.self)
             }
