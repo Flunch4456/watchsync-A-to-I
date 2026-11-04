@@ -11,6 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Vérifier que la montre et l'iPhone parlent le même protocole
+        run: python3 scripts/check_protocol.py
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

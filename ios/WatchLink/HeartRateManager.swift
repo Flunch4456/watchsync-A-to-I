@@ -89,6 +89,7 @@ final class HeartRateManager: NSObject, ObservableObject {
     @Published var syncing = false
     @Published var watchInfo: WatchInfo?
     @Published var watchModel: String?
+    @Published var watchVersion: String?
     @Published var screenImage: UIImage?
     /// 0 = arrêté, 1 = en cours, 2 = impossible (service d'accessibilité ou autorisation manquants)
     @Published var remoteState = 0
@@ -795,6 +796,8 @@ extension HeartRateManager: CBPeripheralDelegate {
                     brightness: Int(bytes[10]),
                     dnd: bytes[11] != 0,
                     saver: bytes[12] != 0)
+            } else if kind == 0x07, bytes.count >= 2 {
+                watchVersion = String(decoding: bytes[1...], as: UTF8.self)
             } else if kind == 0x06, bytes.count >= 2 {
                 remoteState = Int(bytes[1])
                 if bytes[1] == 0 { screenImage = nil }

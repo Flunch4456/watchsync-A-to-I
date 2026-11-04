@@ -4,6 +4,7 @@ import SwiftUI
 struct RemoteScreenView: View {
     @ObservedObject var manager: HeartRateManager
     @State private var quality = 1
+    @State private var noAnswer = false
 
     private static let presets: [(String, Int, Int)] = [
         ("Rapide", 120, 40),
@@ -32,6 +33,9 @@ struct RemoteScreenView: View {
     private var active: Bool { manager.remoteState == 1 }
 
     private var footer: String {
+        if noAnswer && manager.remoteState == 0 {
+            return "La montre n'a pas répondu. Vérifie que l'APK installé sur la montre est bien la version 0.8.1 ou plus récente (visible dans Contrôle de la montre), et que la montre est connectée."
+        }
         switch manager.remoteState {
         case 1: return "Environ une image par seconde. L'écran de la montre reste allumé et l'affichage s'arrête seul au bout de 5 minutes."
         case 2: return "Impossible de démarrer : autorise d'abord la montre avec adb shell pm grant fr.nino.watchlink android.permission.WRITE_SECURE_SETTINGS, puis réessaie."
@@ -114,7 +118,9 @@ struct RemoteScreenView: View {
             } else {
                 Button {
                     let preset = Self.presets[quality]
+                    noAnswer = false
                     manager.remoteStart(side: preset.1, quality: preset.2)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { noAnswer = true }
                 } label: {
                     Label("Afficher l'écran de la montre", systemImage: "play.fill").frame(maxWidth: .infinity)
                 }

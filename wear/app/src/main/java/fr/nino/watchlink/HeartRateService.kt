@@ -139,6 +139,7 @@ class HeartRateService : Service(), SensorEventListener {
         private const val EVENT_WORN = 0x02 // [0x02, 1 = portée, 0 = retirée]
         private const val EVENT_INFO = 0x04 // état de la montre
         private const val EVENT_MODEL = 0x05 // nom du modèle
+        private const val EVENT_VERSION = 0x07 // [0x07, version de l'app montre en texte]
         private const val EVENT_REMOTE = 0x06 // [0x06, 0 arrêté, 1 en cours, 2 accessibilité indisponible]
         private const val EVENT_PHONE_ALERT = 0x03 // [0x03, 1 = sonner, 2 = vibrer, 0 = annuler]
 
@@ -1013,6 +1014,14 @@ class HeartRateService : Service(), SensorEventListener {
         handler.postDelayed({
             sendEvent(byteArrayOf(EVENT_MODEL.toByte()) + Build.MODEL.toByteArray(Charsets.UTF_8).take(19).toByteArray())
         }, 400)
+        handler.postDelayed({
+            val version = try {
+                packageManager.getPackageInfo(packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0)).versionName ?: "?"
+            } catch (e: Exception) {
+                "?"
+            }
+            sendEvent(byteArrayOf(EVENT_VERSION.toByte()) + version.toByteArray(Charsets.UTF_8).take(19).toByteArray())
+        }, 800)
     }
 
     // --- Heures calmes, filtre par app, rappel de bouger ------------------------------
@@ -1470,7 +1479,8 @@ class HeartRateService : Service(), SensorEventListener {
     /** Commandes envoyées par un iPhone lié. */
     private fun handleCommand(device: BluetoothDevice, value: ByteArray) {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        when (value.firstOrNull()?.toInt()) {
+        // Un octet Kotlin est signé : 0x84 vaut -124. On le convertit en non signé pour comparer aux codes de commande.
+        when (value.firstOrNull()?.let { it.toInt() and 0xFF }) {
             CMD_RING_START -> startRing()
             CMD_VIBRATE_START -> startVibrateOnly()
             CMD_RING_STOP -> {

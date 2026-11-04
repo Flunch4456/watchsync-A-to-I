@@ -8,6 +8,7 @@ struct WatchControlView: View {
     @State private var timeout = 30
     @State private var dnd = false
     @State private var saver = false
+    @State private var waited = false
 
     var body: some View {
         Form {
@@ -26,7 +27,10 @@ struct WatchControlView: View {
             }
         }
         .navigationTitle("Contrôle de la montre")
-        .onAppear { manager.requestInfo() }
+        .onAppear {
+            manager.requestInfo()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { waited = true }
+        }
         .onChange(of: manager.watchInfo?.brightness) { value in
             if let value { brightness = Double(Swift.max(1, value)) }
         }
@@ -36,6 +40,7 @@ struct WatchControlView: View {
         Section {
             if let info = manager.watchInfo {
                 LabeledContent("Modèle", value: manager.watchModel ?? "…")
+                LabeledContent("App sur la montre", value: manager.watchVersion ?? "…")
                 LabeledContent("Système", value: info.androidVersion)
                 LabeledContent("Batterie", value: "\(manager.battery ?? 0) %" + (info.charging ? " (en charge)" : ""))
                 LabeledContent("Température batterie", value: String(format: "%.1f °C", info.temperature))
@@ -48,11 +53,19 @@ struct WatchControlView: View {
                 LabeledContent("Ne pas déranger", value: info.dnd ? "Activé" : "Désactivé")
                 LabeledContent("Économie d'énergie", value: info.saver ? "Activée" : "Désactivée")
             } else {
-                Text(manager.authenticated ? "Lecture de l'état de la montre…" : "Montre non connectée.")
-                    .foregroundStyle(.secondary)
+                if !manager.authenticated {
+                    Text("Montre non connectée.").foregroundStyle(.secondary)
+                } else if waited {
+                    Text("La montre ne répond pas à cette demande. Vérifie que l'APK installé sur la montre est bien la version 0.8.1 ou plus récente, puis touche Actualiser.")
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("Lecture de l'état de la montre…").foregroundStyle(.secondary)
+                }
             }
             Button {
+                waited = false
                 manager.requestInfo()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { waited = true }
             } label: {
                 Label("Actualiser", systemImage: "arrow.clockwise")
             }
