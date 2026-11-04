@@ -13,6 +13,134 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.heightCm) private var heightCm = 175
     @AppStorage(SettingsKey.offWristNotify) private var offWristNotify = true
     @AppStorage(SettingsKey.mirrorNotifications) private var mirror = false
+    @AppStorage(SettingsKey.ageYears) private var age = 25
+    @AppStorage(SettingsKey.weightKg) private var weightKg = 70
+    @AppStorage(SettingsKey.stepGoal) private var stepGoal = 8000
+    @AppStorage(SettingsKey.stepGoalNotify) private var stepGoalNotify = true
+    @AppStorage(SettingsKey.moveMinutes) private var moveMinutes = 0
+    @AppStorage(SettingsKey.quietEnabled) private var quietEnabled = false
+    @AppStorage(SettingsKey.quietStart) private var quietStart = 22
+    @AppStorage(SettingsKey.quietEnd) private var quietEnd = 7
+    @AppStorage(SettingsKey.appMask) private var appMask = 65535
+    @AppStorage(SettingsKey.batteryAlert) private var batteryAlert = true
+    @AppStorage(SettingsKey.batteryAlertLevel) private var batteryAlertLevel = 15
+    @AppStorage(SettingsKey.disconnectAlert) private var disconnectAlert = true
+    @State private var exportURL: URL?
+
+    private static let appNames = ["Messages", "Téléphone", "Mail", "WhatsApp", "Instagram", "Snapchat",
+                                   "Telegram", "Messenger", "Discord", "TikTok", "Gmail", "Teams / Skype"]
+
+    /// Applique le changement puis renvoie les réglages à la montre.
+    private func synced<T>(_ binding: Binding<T>) -> Binding<T> {
+        Binding(get: { binding.wrappedValue },
+                set: { binding.wrappedValue = $0; manager.sendConfig() })
+    }
+
+    private func appBinding(_ bit: Int) -> Binding<Bool> {
+        Binding(get: { (appMask >> bit) & 1 == 1 },
+                set: { on in
+                    appMask = on ? (appMask | (1 << bit)) : (appMask & ~(1 << bit))
+                    manager.sendConfig()
+                })
+    }
+
+    private var profileSection: some View {
+        Section {
+            Stepper("Âge : \(age) ans", value: $age, in: 10...90)
+            Stepper("Poids : \(weightKg) kg", value: $weightKg, in: 30...200)
+            Stepper("Objectif : \(stepGoal) pas", value: $stepGoal, in: 1000...30000, step: 500)
+            Toggle("Notifier quand l'objectif est atteint", isOn: $stepGoalNotify)
+        } header: {
+            Text("Profil et objectifs")
+        } footer: {
+            Text("L'âge sert aux zones cardiaques (rythme maximal = 220 − âge), le poids aux calories.")
+        }
+    }
+
+    private var moveSection: some View {
+        Section {
+            Picker("Rappel de bouger", selection: synced($moveMinutes)) {
+                Text("Désactivé").tag(0)
+                Text("Après 30 min sans marcher").tag(30)
+                Text("Après 45 min").tag(45)
+                Text("Après 1 h").tag(60)
+                Text("Après 1 h 30").tag(90)
+            }
+        } header: {
+            Text("Rappel de bouger")
+        } footer: {
+            Text("La montre vibre entre 8 h et 22 h si tu n'as pas marché depuis ce temps. Elle ne le fait pas si elle est retirée du poignet.")
+        }
+    }
+
+    private var quietSection: some View {
+        Section {
+            Toggle("Activer les heures calmes", isOn: synced($quietEnabled))
+            Stepper("De \(quietStart) h", value: synced($quietStart), in: 0...23)
+                .disabled(!quietEnabled)
+            Stepper("À \(quietEnd) h", value: synced($quietEnd), in: 0...23)
+                .disabled(!quietEnabled)
+        } header: {
+            Text("Heures calmes")
+        } footer: {
+            Text("Pendant ces heures, les notifications de l'iPhone arrivent sans pop-up ni vibration et les rappels sont coupés. Les alertes de rythme cardiaque restent actives.")
+        }
+    }
+
+    private var appsSection: some View {
+        Section {
+            ForEach(0..<Self.appNames.count, id: \.self) { i in
+                Toggle(Self.appNames[i], isOn: appBinding(i))
+            }
+            Toggle("Toutes les autres apps", isOn: appBinding(15))
+        } header: {
+            Text("Apps affichées sur la montre")
+        } footer: {
+            Text("Ne concerne que les notifications de l'iPhone envoyées à la montre (réglage ci-dessus).")
+        }
+    }
+
+    private var connectionSection: some View {
+        Section {
+            Toggle("Alerte si la batterie de la montre est faible", isOn: $batteryAlert)
+            Stepper("Seuil : \(batteryAlertLevel) %", value: $batteryAlertLevel, in: 5...50, step: 5)
+                .disabled(!batteryAlert)
+            Toggle("Alerte si la montre se déconnecte", isOn: $disconnectAlert)
+        } header: {
+            Text("Alertes de la montre")
+        } footer: {
+            Text("L'alerte de déconnexion part si la montre reste injoignable plus d'une minute.")
+        }
+    }
+
+    private var dataSection: some View {
+        Section {
+            Button {
+                exportURL = manager.history.exportAllJSON()
+            } label: {
+                Label("Préparer l'export complet (JSON)", systemImage: "square.and.arrow.up")
+            }
+            if let url = exportURL {
+                ShareLink(item: url) {
+                    Label("Partager le fichier", systemImage: "doc")
+                }
+            }
+        } header: {
+            Text("Données")
+        } footer: {
+            Text("Rythme cardiaque, pas par jour et batterie des 7 derniers jours dans un seul fichier.")
+        }
+    }
+
+    @ViewBuilder
+    private var extraSections: some View {
+        profileSection
+        moveSection
+        quietSection
+        appsSection
+        connectionSection
+        dataSection
+    }
 
     var body: some View {
         NavigationStack {
@@ -101,6 +229,8 @@ struct SettingsView: View {
                 } footer: {
                     Text("Au premier essai, iOS demande d'appairer la montre : accepte. Puis dans Réglages iOS > Bluetooth > (i) à côté de la montre, active « Partager les notifications du système ». Sans ça, iOS ne les transmet pas.")
                 }
+
+                extraSections
 
                 if manager.connectedName != nil {
                     Section {

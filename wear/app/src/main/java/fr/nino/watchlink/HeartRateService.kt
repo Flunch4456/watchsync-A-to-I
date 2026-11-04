@@ -43,6 +43,7 @@ import android.os.VibratorManager
 import android.util.Base64
 import android.util.Log
 import java.time.LocalDate
+import java.time.LocalTime
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
@@ -84,6 +85,11 @@ class HeartRateService : Service(), SensorEventListener {
         private const val KEY_STEP_LAST = "step_last"
         private const val KEY_LTK = "ltk"
         private const val KEY_MIRROR = "mirror_notifications"
+        private const val KEY_MOVE_MIN = "move_reminder_min"
+        private const val KEY_APP_MASK = "app_mask"
+        private const val KEY_QUIET_ON = "quiet_on"
+        private const val KEY_QUIET_START = "quiet_start"
+        private const val KEY_QUIET_END = "quiet_end"
 
         private fun std(short: String): UUID =
             UUID.fromString("0000$short-0000-1000-8000-00805f9b34fb")
@@ -109,6 +115,9 @@ class HeartRateService : Service(), SensorEventListener {
         private const val CMD_SET_AUTOSTART = 0x30 // [0x30, 0 ou 1]
         private const val CMD_SET_INTERVAL = 0x40 // [0x40, hi, lo] secondes entre deux mesures (0 = désactivée)
         private const val CMD_SET_MIRROR = 0x60 // [0x60, 0 ou 1] affiche les notifications de l'iPhone
+        private const val CMD_SET_MOVE = 0x70 // [0x70, hi, lo] minutes sans bouger avant le rappel (0 = désactivé)
+        private const val CMD_SET_APPS = 0x71 // [0x71, hi, lo] apps autorisées (un bit par app, bit 15 = les autres)
+        private const val CMD_SET_QUIET = 0x72 // [0x72, actif, heure début, heure fin]
         private const val CMD_SYNC_REQUEST = 0x50 // [0x50, 4 octets] envoie tout ce qui est plus récent (secondes)
 
         // Événements (montre vers iPhone) : premier octet de la notification
@@ -173,6 +182,8 @@ class HeartRateService : Service(), SensorEventListener {
     private var syncInFlight = false
     private var currentMtu = 23
     private var ancs: AncsClient? = null
+    private var lastMoveAt = SystemClock.elapsedRealtime()
+    private var lastMoveSteps = -1
 
     private var lastBpm = 0
     private var lastAlertAt = 0L
@@ -231,6 +242,7 @@ class HeartRateService : Service(), SensorEventListener {
             startSensors()
             startBle()
             handler.post(batteryRunnable)
+            handler.postDelayed(moveRunnable, 60_000)
         }
         return START_STICKY
     }
@@ -346,6 +358,7 @@ class HeartRateService : Service(), SensorEventListener {
         onBody = worn
         notifyWorn()
         if (worn) {
+            lastMoveAt = SystemClock.elapsedRealtime()
             status("Montre portée")
             applyInterval()
         } else {
@@ -499,6 +512,12 @@ class HeartRateService : Service(), SensorEventListener {
             .apply()
 
         stepsToday = (carry + counter - base).coerceAtLeast(0).toInt()
+        if (lastMoveSteps < 0 || stepsToday < lastMoveSteps) {
+            lastMoveSteps = stepsToday
+        } else if (stepsToday - lastMoveSteps >= 30) {
+            lastMoveSteps = stepsToday
+            lastMoveAt = SystemClock.elapsedRealtime()
+        }
         logSteps(stepsToday)
 
         val now = SystemClock.elapsedRealtime()
@@ -761,6 +780,63 @@ class HeartRateService : Service(), SensorEventListener {
         }
     }
 
+    // --- Heures calmes, filtre par app, rappel de bouger ------------------------------
+
+    /** Un bit par app, dans le même ordre que la liste de l'app iPhone. */
+    private val appMatchers: List<List<String>> = listOf(
+        listOf("mobilesms"), listOf("mobilephone"), listOf("mobilemail"), listOf("whatsapp"),
+        listOf("instagram"), listOf("snapchat"), listOf("telegram", "telegraph"),
+        listOf("facebook.orca", "messenger"), listOf("discord"), listOf("musically", "tiktok"),
+        listOf("gmail"), listOf("skype", "teams")
+    )
+
+    private fun appAllowed(appId: String): Boolean {
+        val mask = getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_APP_MASK, 0xFFFF)
+        val id = appId.lowercase()
+        val index = appMatchers.indexOfFirst { group -> group.any { id.contains(it) } }
+        val bit = if (index >= 0) index else 15
+        return ((mask shr bit) and 1) == 1
+    }
+
+    private fun isQuiet(): Boolean {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(KEY_QUIET_ON, false)) return false
+        val start = prefs.getInt(KEY_QUIET_START, 22)
+        val end = prefs.getInt(KEY_QUIET_END, 7)
+        val hour = LocalTime.now().hour
+        return if (start <= end) hour in start until end else (hour >= start || hour < end)
+    }
+
+    private val moveRunnable: Runnable = object : Runnable {
+        override fun run() {
+            val minutes = getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_MOVE_MIN, 0)
+            val now = SystemClock.elapsedRealtime()
+            val hour = LocalTime.now().hour
+            if (minutes > 0 && onBody && !isQuiet() && hour in 8..21 && now - lastMoveAt >= minutes * 60_000L) {
+                lastMoveAt = now
+                remindToMove()
+            }
+            handler.postDelayed(this, 60_000)
+        }
+    }
+
+    private fun remindToMove() {
+        vibrate(longArrayOf(0, 300, 200, 300), -1)
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel("move", "Rappel de bouger", NotificationManager.IMPORTANCE_HIGH)
+        )
+        nm.notify(
+            2,
+            Notification.Builder(this, "move")
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("Bouge un peu")
+                .setContentText("Tu n'as pas marché depuis un moment.")
+                .setAutoCancel(true)
+                .build()
+        )
+    }
+
     // --- Notifications de l'iPhone affichées sur la montre (ANCS) ---------------------
 
     private fun applyMirror(device: BluetoothDevice) {
@@ -770,7 +846,7 @@ class HeartRateService : Service(), SensorEventListener {
             return
         }
         try {
-            val client = ancs ?: AncsClient(this) { text -> status(text) }.also { ancs = it }
+            val client = ancs ?: AncsClient(this, { text -> status(text) }, { id -> appAllowed(id) }, { isQuiet() }).also { ancs = it }
             client.start(device)
         } catch (e: Exception) {
             Log.w(TAG, "ANCS: $e")
@@ -1185,6 +1261,22 @@ class HeartRateService : Service(), SensorEventListener {
             CMD_SET_MIRROR -> if (value.size >= 2) {
                 prefs.edit().putBoolean(KEY_MIRROR, value[1].toInt() != 0).apply()
                 applyMirror(device)
+            }
+            CMD_SET_MOVE -> if (value.size >= 3) {
+                val minutes = ((value[1].toInt() and 0xFF) shl 8) or (value[2].toInt() and 0xFF)
+                prefs.edit().putInt(KEY_MOVE_MIN, minutes).apply()
+                lastMoveAt = SystemClock.elapsedRealtime()
+            }
+            CMD_SET_APPS -> if (value.size >= 3) {
+                val mask = ((value[1].toInt() and 0xFF) shl 8) or (value[2].toInt() and 0xFF)
+                prefs.edit().putInt(KEY_APP_MASK, mask).apply()
+            }
+            CMD_SET_QUIET -> if (value.size >= 4) {
+                prefs.edit()
+                    .putBoolean(KEY_QUIET_ON, value[1].toInt() != 0)
+                    .putInt(KEY_QUIET_START, value[2].toInt() and 0xFF)
+                    .putInt(KEY_QUIET_END, value[3].toInt() and 0xFF)
+                    .apply()
             }
             CMD_SYNC_REQUEST -> if (value.size >= 5) {
                 var since = 0L

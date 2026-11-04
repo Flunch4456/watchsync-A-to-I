@@ -12,8 +12,8 @@ android {
         // Wear OS 4 (Android 13) minimum : la Galaxy Watch FE est en Wear OS 5
         minSdk = 33
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.5.1"
+        versionCode = 7
+        versionName = "0.6.0"
     }
 
     compileOptions {

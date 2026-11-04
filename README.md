@@ -7,6 +7,12 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Nouveautés de la version 0.6.0
+
+- **Bilan du jour** (onglet Activité) : objectif de pas avec barre de progression, calories actives, minutes actives, rythme au repos, sommeil estimé, zones cardiaques.
+- **Réglages** : âge, poids, objectif de pas (notification quand il est atteint), rappel de bouger (la montre vibre), heures calmes, choix des apps affichées sur la montre, alertes de batterie faible et de déconnexion, export complet en JSON.
+- Calories, zones et sommeil sont des estimations. Retour arrière : branche `stable-v0.5.1`.
+
 ## Nouveautés de la version 0.5.1
 
 - Notifications de l'iPhone plus complètes sur la montre : vrai nom de l'app, expéditeur / titre, objet et contenu du message, en pop-up. Retour arrière : branche `stable-v0.5.0`.

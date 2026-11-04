@@ -24,6 +24,7 @@ struct ActivityView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     todayCard
+                    SummaryView(manager: manager, history: history)
                     weekChart
                     batteryChart
                 }

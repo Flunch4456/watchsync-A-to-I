@@ -230,6 +230,31 @@ final class HistoryStore: ObservableObject {
         return fresh.count
     }
 
+    // MARK: - Export complet
+
+    private struct FullExport: Encodable {
+        let exporte: String
+        let sessions: [Session]
+        let pasParJour: [String: Int]
+        let batterie: [Sample]
+    }
+
+    /// Toutes les données de l'app dans un seul fichier JSON à partager.
+    func exportAllJSON() -> URL? {
+        let export = FullExport(exporte: ISO8601DateFormatter().string(from: Date()),
+                                sessions: sessions, pasParJour: dailySteps, batterie: batteryLog)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(export) else { return nil }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("watchlink-donnees.json")
+        do {
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
     // MARK: - Fichiers
 
     func save() {

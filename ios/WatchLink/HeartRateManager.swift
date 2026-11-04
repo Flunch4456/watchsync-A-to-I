@@ -17,6 +17,18 @@ enum SettingsKey {
     static let heightCm = "heightCm"
     static let offWristNotify = "offWristNotify"
     static let mirrorNotifications = "mirrorNotifications"
+    static let ageYears = "ageYears"
+    static let weightKg = "weightKg"
+    static let stepGoal = "stepGoal"
+    static let stepGoalNotify = "stepGoalNotify"
+    static let moveMinutes = "moveMinutes"
+    static let quietEnabled = "quietEnabled"
+    static let quietStart = "quietStart"
+    static let quietEnd = "quietEnd"
+    static let appMask = "appMask"
+    static let batteryAlert = "batteryAlert"
+    static let batteryAlertLevel = "batteryAlertLevel"
+    static let disconnectAlert = "disconnectAlert"
 }
 
 /// Ce que la montre est en train de faire pour qu'on la retrouve.
@@ -99,7 +111,19 @@ final class HeartRateManager: NSObject, ObservableObject {
             SettingsKey.hrInterval: 1,
             SettingsKey.heightCm: 175,
             SettingsKey.offWristNotify: true,
-            SettingsKey.mirrorNotifications: false
+            SettingsKey.mirrorNotifications: false,
+            SettingsKey.ageYears: 25,
+            SettingsKey.weightKg: 70,
+            SettingsKey.stepGoal: 8000,
+            SettingsKey.stepGoalNotify: true,
+            SettingsKey.moveMinutes: 0,
+            SettingsKey.quietEnabled: false,
+            SettingsKey.quietStart: 22,
+            SettingsKey.quietEnd: 7,
+            SettingsKey.appMask: 65535,
+            SettingsKey.batteryAlert: true,
+            SettingsKey.batteryAlertLevel: 15,
+            SettingsKey.disconnectAlert: true
         ])
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermission()
@@ -137,6 +161,7 @@ final class HeartRateManager: NSObject, ObservableObject {
     func forget() {
         UserDefaults.standard.removeObject(forKey: Self.savedKey)
         UserDefaults.standard.removeObject(forKey: Self.pairKey)
+        cancelDisconnectAlert()
         if let p = current { central.cancelPeripheralConnection(p) }
         current = nil
         resetLiveState()
@@ -190,6 +215,15 @@ final class HeartRateManager: NSObject, ObservableObject {
         write([0x10, UInt8(clamping: low), UInt8(clamping: high), flags])
         write([0x30, d.bool(forKey: SettingsKey.autostart) ? 1 : 0])
         write([0x60, d.bool(forKey: SettingsKey.mirrorNotifications) ? 1 : 0])
+
+        let move = UInt16(clamping: d.integer(forKey: SettingsKey.moveMinutes))
+        write([0x70, UInt8(move >> 8), UInt8(move & 0xFF)])
+        let mask = UInt16(clamping: d.integer(forKey: SettingsKey.appMask))
+        write([0x71, UInt8(mask >> 8), UInt8(mask & 0xFF)])
+        write([0x72,
+               d.bool(forKey: SettingsKey.quietEnabled) ? 1 : 0,
+               UInt8(clamping: d.integer(forKey: SettingsKey.quietStart)),
+               UInt8(clamping: d.integer(forKey: SettingsKey.quietEnd))])
 
         let seconds = UInt16(clamping: d.integer(forKey: SettingsKey.hrInterval))
         write([0x40, UInt8(seconds >> 8), UInt8(seconds & 0xFF)])
@@ -299,6 +333,7 @@ final class HeartRateManager: NSObject, ObservableObject {
     }
 
     private func onAuthenticated() {
+        cancelDisconnectAlert()
         authenticated = true
         needsCode = false
         codeError = nil
@@ -382,6 +417,62 @@ final class HeartRateManager: NSObject, ObservableObject {
                     UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
             }
         }
+    }
+
+    // MARK: - Alertes : batterie, connexion, objectif de pas
+
+    private var batteryAlertSent = false
+
+    private func notify(_ title: String, _ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
+    private func checkBatteryAlert(_ level: Int) {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: SettingsKey.batteryAlert) else { return }
+        let threshold = d.integer(forKey: SettingsKey.batteryAlertLevel)
+        if level <= threshold {
+            if !batteryAlertSent {
+                batteryAlertSent = true
+                notify("Batterie de la montre faible", "Il reste \(level) %.")
+            }
+        } else if level > threshold + 5 {
+            batteryAlertSent = false
+        }
+    }
+
+    private func checkStepGoal(_ n: Int) {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: SettingsKey.stepGoalNotify) else { return }
+        let goal = d.integer(forKey: SettingsKey.stepGoal)
+        let today = HistoryStore.dayKey()
+        guard goal > 0, n >= goal, d.string(forKey: "stepGoalDay") != today else { return }
+        d.set(today, forKey: "stepGoalDay")
+        notify("Objectif de pas atteint", "\(n) pas aujourd'hui, objectif de \(goal) atteint.")
+    }
+
+    /// Notification de déconnexion programmée 1 minute à l'avance : iOS la déclenche même si l'app est
+    /// suspendue, et on l'annule si la montre revient avant.
+    private func scheduleDisconnectAlert() {
+        guard UserDefaults.standard.bool(forKey: SettingsKey.disconnectAlert) else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Montre déconnectée"
+        content.body = "L'iPhone ne reçoit plus ta montre. Elle est peut-être hors de portée."
+        content.sound = .default
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 60, repeats: false)
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "disconnect-alert", content: content, trigger: trigger))
+    }
+
+    private func cancelDisconnectAlert() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: ["disconnect-alert"])
+        center.removeDeliveredNotifications(withIdentifiers: ["disconnect-alert"])
     }
 
     // MARK: - Alertes sur l'iPhone
@@ -487,7 +578,9 @@ extension HeartRateManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        let wasConnected = authenticated
         resetLiveState()
+        if wasConnected { scheduleDisconnectAlert() }
         // Si l'utilisateur a oublié la montre, on ne se reconnecte pas
         guard UserDefaults.standard.string(forKey: Self.savedKey) == peripheral.identifier.uuidString else { return }
         status = "Montre déconnectée, reconnexion automatique…"
@@ -559,6 +652,7 @@ extension HeartRateManager: CBPeripheralDelegate {
             if let level = data.first {
                 battery = Int(level)
                 history.addBattery(Int(level))
+                checkBatteryAlert(Int(level))
             }
 
         case Self.controlEvent:
@@ -569,6 +663,7 @@ extension HeartRateManager: CBPeripheralDelegate {
                 let n = Self.le32(bytes, at: 1)
                 steps = n
                 history.setSteps(n)
+                checkStepGoal(n)
             } else if kind == 0x02, bytes.count >= 2 {
                 setWorn(bytes[1] != 0)
             } else if kind == 0x03, bytes.count >= 2 {

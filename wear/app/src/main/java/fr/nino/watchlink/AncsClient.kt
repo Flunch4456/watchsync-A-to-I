@@ -25,11 +25,17 @@ import java.util.UUID
  * affiche sur la montre. L'iPhone n'expose ce service qu'à un appareil appairé (bond) auquel
  * l'utilisateur a accordé « Partager les notifications du système » dans Réglages > Bluetooth.
  */
-class AncsClient(private val context: Context, private val onStatus: (String) -> Unit) {
+class AncsClient(
+    private val context: Context,
+    private val onStatus: (String) -> Unit,
+    private val appAllowed: (String) -> Boolean,
+    private val isQuiet: () -> Boolean
+) {
 
     companion object {
         private const val TAG = "WatchLinkAncs"
         private const val CHANNEL = "iphone_notifications_v2"
+        private const val CHANNEL_QUIET = "iphone_notifications_quiet"
         private val SERVICE: UUID = UUID.fromString("7905F431-B5CE-4E99-A40F-4B1E122D00D0")
         private val NOTIFICATION_SOURCE: UUID = UUID.fromString("9FBF120D-6301-42D9-8C58-25E699A21DBD")
         private val CONTROL_POINT: UUID = UUID.fromString("69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9")
@@ -298,6 +304,8 @@ class AncsClient(private val context: Context, private val onStatus: (String) ->
     }
 
     private fun onNotification(uid: Long, appId: String, title: String, subtitle: String, message: String) {
+        // Filtre par app choisi sur l'iPhone
+        if (!appAllowed(appId)) return
         val known = appNames[appId]
         if (known != null || appId.isEmpty()) {
             post(uid, known ?: "iPhone", title, subtitle, message)
@@ -337,8 +345,13 @@ class AncsClient(private val context: Context, private val onStatus: (String) ->
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL, "Notifications iPhone", NotificationManager.IMPORTANCE_HIGH)
         )
+        // Heures calmes : la notification arrive dans la liste, sans pop-up ni vibration
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_QUIET, "Notifications iPhone (heures calmes)", NotificationManager.IMPORTANCE_LOW)
+        )
+        val channel = if (isQuiet()) CHANNEL_QUIET else CHANNEL
         val body = listOf(subtitle, message).filter { it.isNotBlank() }.joinToString("\n")
-        val notification = Notification.Builder(context, CHANNEL)
+        val notification = Notification.Builder(context, channel)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(title.ifBlank { app })
             .setContentText(body.lineSequence().firstOrNull() ?: "")
