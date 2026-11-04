@@ -712,7 +712,7 @@ extension HeartRateManager: CBPeripheralDelegate {
                 setWorn(bytes[1] != 0)
             } else if kind == 0x03, bytes.count >= 2 {
                 finder.handle(kind: Int(bytes[1]))
-            } else if kind == 0x04, bytes.count >= 14 {
+            } else if kind == 0x04, bytes.count >= 13 {
                 watchInfo = WatchInfo(
                     temperature: Double(Int(bytes[1]) << 8 | Int(bytes[2])) / 10,
                     charging: bytes[3] != 0,
