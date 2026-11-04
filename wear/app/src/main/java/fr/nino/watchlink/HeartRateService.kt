@@ -31,6 +31,11 @@ import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.BatteryManager
+import android.os.Build
+import android.os.Environment
+import android.os.StatFs
+import android.provider.Settings
+import android.content.IntentFilter
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -118,11 +123,18 @@ class HeartRateService : Service(), SensorEventListener {
         private const val CMD_SET_MOVE = 0x70 // [0x70, hi, lo] minutes sans bouger avant le rappel (0 = désactivé)
         private const val CMD_SET_APPS = 0x71 // [0x71, hi, lo] apps autorisées (un bit par app, bit 15 = les autres)
         private const val CMD_SET_QUIET = 0x72 // [0x72, actif, heure début, heure fin]
+        private const val CMD_BRIGHTNESS = 0x80 // [0x80, niveau 1-255, auto 0/1]
+        private const val CMD_TIMEOUT = 0x81 // [0x81, hi, lo] durée d'écran allumé en secondes
+        private const val CMD_DND = 0x82 // [0x82, 0/1] ne pas déranger
+        private const val CMD_SAVER = 0x83 // [0x83, 0/1] économie d'énergie
+        private const val CMD_INFO = 0x84 // demande l'état de la montre
         private const val CMD_SYNC_REQUEST = 0x50 // [0x50, 4 octets] envoie tout ce qui est plus récent (secondes)
 
         // Événements (montre vers iPhone) : premier octet de la notification
         private const val EVENT_STEPS = 0x01 // [0x01, pas du jour sur 4 octets]
         private const val EVENT_WORN = 0x02 // [0x02, 1 = portée, 0 = retirée]
+        private const val EVENT_INFO = 0x04 // état de la montre
+        private const val EVENT_MODEL = 0x05 // nom du modèle
         private const val EVENT_PHONE_ALERT = 0x03 // [0x03, 1 = sonner, 2 = vibrer, 0 = annuler]
 
         // Synchronisation : types de paquets
@@ -780,6 +792,91 @@ class HeartRateService : Service(), SensorEventListener {
         }
     }
 
+    // --- Contrôle de la montre depuis l'iPhone -------------------------------------------
+    // Ces réglages système exigent une autorisation donnée une fois par ADB (voir le README).
+
+    private fun be16(v: Int): ByteArray = byteArrayOf(((v shr 8) and 0xFF).toByte(), (v and 0xFF).toByte())
+
+    private fun setBrightness(level: Int, auto: Boolean) {
+        try {
+            if (!Settings.System.canWrite(this)) {
+                status("Autorisation manquante : adb shell appops set fr.nino.watchlink WRITE_SETTINGS allow")
+                return
+            }
+            Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE, if (auto) 1 else 0)
+            Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, level.coerceIn(1, 255))
+            status("Luminosité réglée")
+        } catch (e: Exception) {
+            status("Luminosité : réglage refusé")
+        }
+    }
+
+    private fun setScreenTimeout(seconds: Int) {
+        try {
+            if (!Settings.System.canWrite(this)) {
+                status("Autorisation manquante : adb shell appops set fr.nino.watchlink WRITE_SETTINGS allow")
+                return
+            }
+            Settings.System.putInt(contentResolver, Settings.System.SCREEN_OFF_TIMEOUT, seconds.coerceIn(5, 3600) * 1000)
+            status("Durée d'écran réglée")
+        } catch (e: Exception) {
+            status("Durée d'écran : réglage refusé")
+        }
+    }
+
+    private fun setDnd(on: Boolean) {
+        val nm = getSystemService(NotificationManager::class.java)
+        if (!nm.isNotificationPolicyAccessGranted) {
+            status("Autorisation manquante : adb shell cmd notification allow_dnd fr.nino.watchlink")
+            return
+        }
+        nm.setInterruptionFilter(
+            if (on) NotificationManager.INTERRUPTION_FILTER_NONE else NotificationManager.INTERRUPTION_FILTER_ALL
+        )
+        status(if (on) "Ne pas déranger activé" else "Ne pas déranger désactivé")
+    }
+
+    private fun setPowerSaver(on: Boolean) {
+        try {
+            Settings.Global.putInt(contentResolver, "low_power", if (on) 1 else 0)
+            status(if (on) "Économie d'énergie activée" else "Économie d'énergie désactivée")
+        } catch (e: Exception) {
+            status("Autorisation manquante : adb shell pm grant fr.nino.watchlink android.permission.WRITE_SECURE_SETTINGS")
+        }
+    }
+
+    /** Envoie l'état de la montre : température de batterie, charge, stockage, temps depuis le démarrage, réglages. */
+    private fun sendDeviceInfo() {
+        val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val temperature = battery?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+        val charging = if ((battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0) 1 else 0
+        val freeMb = (StatFs(Environment.getDataDirectory().path).availableBytes / (1024 * 1024))
+            .coerceAtMost(65535).toInt()
+        val uptimeHours = (SystemClock.elapsedRealtime() / 3_600_000).coerceAtMost(65535).toInt()
+        val brightness = try {
+            Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+        } catch (e: Exception) {
+            128
+        }
+        val nm = getSystemService(NotificationManager::class.java)
+        val filter = nm.currentInterruptionFilter
+        val dnd = if (filter != NotificationManager.INTERRUPTION_FILTER_ALL &&
+            filter != NotificationManager.INTERRUPTION_FILTER_UNKNOWN) 1 else 0
+        val saver = if (getSystemService(PowerManager::class.java).isPowerSaveMode) 1 else 0
+        sendEvent(
+            byteArrayOf(EVENT_INFO.toByte()) + be16(temperature) + byteArrayOf(charging.toByte()) +
+                be16(freeMb) + be16(uptimeHours) +
+                byteArrayOf(
+                    Build.VERSION.SDK_INT.toByte(), if (onBody) 1 else 0,
+                    brightness.coerceIn(0, 255).toByte(), dnd.toByte(), saver.toByte()
+                )
+        )
+        // Une notification Bluetooth à la fois : le nom du modèle part juste après
+        handler.postDelayed({
+            sendEvent(byteArrayOf(EVENT_MODEL.toByte()) + Build.MODEL.toByteArray(Charsets.UTF_8).take(19).toByteArray())
+        }, 400)
+    }
+
     // --- Heures calmes, filtre par app, rappel de bouger ------------------------------
 
     /** Un bit par app, dans le même ordre que la liste de l'app iPhone. */
@@ -1278,6 +1375,13 @@ class HeartRateService : Service(), SensorEventListener {
                     .putInt(KEY_QUIET_END, value[3].toInt() and 0xFF)
                     .apply()
             }
+            CMD_BRIGHTNESS -> if (value.size >= 3) setBrightness(value[1].toInt() and 0xFF, value[2].toInt() != 0)
+            CMD_TIMEOUT -> if (value.size >= 3) {
+                setScreenTimeout(((value[1].toInt() and 0xFF) shl 8) or (value[2].toInt() and 0xFF))
+            }
+            CMD_DND -> if (value.size >= 2) setDnd(value[1].toInt() != 0)
+            CMD_SAVER -> if (value.size >= 2) setPowerSaver(value[1].toInt() != 0)
+            CMD_INFO -> sendDeviceInfo()
             CMD_SYNC_REQUEST -> if (value.size >= 5) {
                 var since = 0L
                 for (k in 0 until 4) {

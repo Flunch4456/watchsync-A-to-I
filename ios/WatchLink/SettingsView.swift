@@ -132,8 +132,21 @@ struct SettingsView: View {
         }
     }
 
+    private var controlSection: some View {
+        Section {
+            NavigationLink {
+                WatchControlView(manager: manager)
+            } label: {
+                Label("Contrôle de la montre", systemImage: "applewatch.watchface")
+            }
+        } footer: {
+            Text("État détaillé de la montre, luminosité, durée d'écran, ne pas déranger, économie d'énergie.")
+        }
+    }
+
     @ViewBuilder
     private var extraSections: some View {
+        controlSection
         profileSection
         moveSection
         quietSection

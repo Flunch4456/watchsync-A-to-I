@@ -31,6 +31,30 @@ enum SettingsKey {
     static let disconnectAlert = "disconnectAlert"
 }
 
+/// État détaillé de la montre, envoyé à la demande.
+struct WatchInfo {
+    var temperature: Double   // °C, batterie
+    var charging: Bool
+    var freeMB: Int
+    var uptimeHours: Int
+    var sdk: Int
+    var worn: Bool
+    var brightness: Int
+    var dnd: Bool
+    var saver: Bool
+
+    /// Version d'Android correspondant au niveau d'API.
+    var androidVersion: String {
+        switch sdk {
+        case 36: return "Android 16"
+        case 35: return "Android 15"
+        case 34: return "Android 14"
+        case 33: return "Android 13"
+        default: return "API \(sdk)"
+        }
+    }
+}
+
 /// Ce que la montre est en train de faire pour qu'on la retrouve.
 enum WatchAlert {
     case none, ring, vibrate
@@ -62,6 +86,8 @@ final class HeartRateManager: NSObject, ObservableObject {
     @Published var authenticated = false
     @Published var codeError: String?
     @Published var syncing = false
+    @Published var watchInfo: WatchInfo?
+    @Published var watchModel: String?
 
     let history = HistoryStore()
 
@@ -192,6 +218,7 @@ final class HeartRateManager: NSObject, ObservableObject {
         authenticated = false
         needsCode = false
         syncing = false
+        watchInfo = nil
         attempt = .none
         pendingCode = nil
         watchAlert = .none
@@ -228,6 +255,23 @@ final class HeartRateManager: NSObject, ObservableObject {
         let seconds = UInt16(clamping: d.integer(forKey: SettingsKey.hrInterval))
         write([0x40, UInt8(seconds >> 8), UInt8(seconds & 0xFF)])
     }
+
+    // MARK: - Contrôle de la montre
+
+    func requestInfo() { write([0x84]) }
+
+    func setBrightness(_ level: Int, auto: Bool) {
+        write([0x80, UInt8(clamping: level), auto ? 1 : 0])
+    }
+
+    func setScreenTimeout(_ seconds: Int) {
+        let v = UInt16(clamping: seconds)
+        write([0x81, UInt8(v >> 8), UInt8(v & 0xFF)])
+    }
+
+    func setDnd(_ on: Bool) { write([0x82, on ? 1 : 0]) }
+
+    func setPowerSaver(_ on: Bool) { write([0x83, on ? 1 : 0]) }
 
     func startRing() {
         write([0x01])
@@ -668,6 +712,19 @@ extension HeartRateManager: CBPeripheralDelegate {
                 setWorn(bytes[1] != 0)
             } else if kind == 0x03, bytes.count >= 2 {
                 finder.handle(kind: Int(bytes[1]))
+            } else if kind == 0x04, bytes.count >= 14 {
+                watchInfo = WatchInfo(
+                    temperature: Double(Int(bytes[1]) << 8 | Int(bytes[2])) / 10,
+                    charging: bytes[3] != 0,
+                    freeMB: Int(bytes[4]) << 8 | Int(bytes[5]),
+                    uptimeHours: Int(bytes[6]) << 8 | Int(bytes[7]),
+                    sdk: Int(bytes[8]),
+                    worn: bytes[9] != 0,
+                    brightness: Int(bytes[10]),
+                    dnd: bytes[11] != 0,
+                    saver: bytes[12] != 0)
+            } else if kind == 0x05, bytes.count >= 2 {
+                watchModel = String(decoding: bytes[1...], as: UTF8.self)
             }
 
         case Self.hrMeasurement:

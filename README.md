@@ -7,6 +7,19 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Nouveautés de la version 0.7.0
+
+- **Contrôle de la montre** (Réglages > Contrôle de la montre) : état détaillé (modèle, Android, température de batterie, stockage, temps depuis le démarrage), luminosité, durée d'écran allumé, ne pas déranger, économie d'énergie.
+- Autorisations à donner une fois sur la montre :
+
+```
+adb shell appops set fr.nino.watchlink WRITE_SETTINGS allow
+adb shell cmd notification allow_dnd fr.nino.watchlink
+adb shell pm grant fr.nino.watchlink android.permission.WRITE_SECURE_SETTINGS
+```
+
+- Retour arrière : branche `stable-v0.6.0`.
+
 ## Nouveautés de la version 0.6.0
 
 - **Bilan du jour** (onglet Activité) : objectif de pas avec barre de progression, calories actives, minutes actives, rythme au repos, sommeil estimé, zones cardiaques.
