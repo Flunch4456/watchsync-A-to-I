@@ -90,6 +90,8 @@ final class HeartRateManager: NSObject, ObservableObject {
     @Published var watchInfo: WatchInfo?
     @Published var watchModel: String?
     @Published var watchVersion: String?
+    @Published var fastChannel = false
+    @Published var fastChannelError: String?
     @Published var screenImage: UIImage?
     /// 0 = arrêté, 1 = en cours, 2 = impossible (service d'accessibilité ou autorisation manquants)
     @Published var remoteState = 0
