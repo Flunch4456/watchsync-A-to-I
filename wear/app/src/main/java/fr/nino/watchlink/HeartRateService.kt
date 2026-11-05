@@ -153,7 +153,6 @@ class HeartRateService : Service(), SensorEventListener {
         private const val SYNC_HEART_RATE = 0x01
         private const val SYNC_BATTERY = 0x02
         private const val SYNC_STEPS = 0x03
-        private const val L2CAP_WAIT_MS = 4000L // attente maximale du canal rapide avant le mode de secours
         private const val SYNC_FRAME = 0x10 // image de l'écran à distance
         private const val SYNC_END = 0xFF
 
@@ -820,8 +819,6 @@ class HeartRateService : Service(), SensorEventListener {
     private var screenLock: PowerManager.WakeLock? = null
     private var lastFrame: ByteArray? = null
     private var remoteStartedAt = 0L
-    private var psmPacket: ByteArray? = null
-    private var remoteStartedAt = 0L
     private var l2capWanted = false
 
     // Canal rapide (L2CAP) : beaucoup plus de débit que les notifications Bluetooth
@@ -946,21 +943,9 @@ class HeartRateService : Service(), SensorEventListener {
         handler.post(remoteRunnable)
     }
 
-    private val psmRunnable: Runnable = Runnable {
-        val packet = psmPacket
-        if (remoteOn && packet != null && l2capOut == null &&
-            SystemClock.elapsedRealtime() - remoteStartedAt < L2CAP_WAIT_MS
-        ) {
-            sendEvent(packet)
-            handler.postDelayed(psmRunnable, 600)
-        }
-    }
-
     private fun stopRemote() {
         val wasOn = remoteOn
         remoteOn = false
-        psmPacket = null
-        handler.removeCallbacks(psmRunnable)
         handler.removeCallbacks(remoteRunnable)
         handler.removeCallbacks(remoteStopRunnable)
         closeL2cap()
@@ -989,13 +974,6 @@ class HeartRateService : Service(), SensorEventListener {
         }
         // On laisse d'abord sa chance au canal rapide (4 s au plus), avant de se rabattre sur les notifications
         if (l2capWanted && l2capOut == null && SystemClock.elapsedRealtime() - remoteStartedAt < 4000) {
-            handler.postDelayed(remoteRunnable, 100)
-            return
-        }
-        // On laisse quelques secondes au canal rapide pour s'ouvrir avant de se rabattre sur les notifications
-        if (psmPacket != null && l2capOut == null &&
-            SystemClock.elapsedRealtime() - remoteStartedAt < L2CAP_WAIT_MS
-        ) {
             handler.postDelayed(remoteRunnable, 100)
             return
         }

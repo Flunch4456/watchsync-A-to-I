@@ -28,17 +28,6 @@ struct RemoteScreenView: View {
                     }
                 }
                 screen
-                if active {
-                    Label(manager.fastChannel ? "Canal rapide" : "Mode lent (notifications)",
-                          systemImage: manager.fastChannel ? "bolt.fill" : "tortoise.fill")
-                        .font(.footnote)
-                        .foregroundStyle(manager.fastChannel ? .green : .orange)
-                    if let error = manager.fastChannelError {
-                        Text("Canal rapide impossible : \(error)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
                 navigation
                 settings
                 Text(footer)
