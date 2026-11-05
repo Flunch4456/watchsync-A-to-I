@@ -144,8 +144,9 @@ struct SettingsView: View {
             } label: {
                 Label("Écran de la montre à distance", systemImage: "rectangle.on.rectangle")
             }
+            UpdateLinkRow(manager: manager, updater: manager.updater)
         } footer: {
-            Text("État détaillé de la montre, luminosité, durée d'écran, ne pas déranger, économie d'énergie.")
+            Text("État détaillé de la montre, luminosité, durée d'écran, ne pas déranger, économie d'énergie, mises à jour depuis GitHub.")
         }
     }
 

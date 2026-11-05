@@ -130,6 +130,8 @@ final class HeartRateManager: NSObject, ObservableObject {
     private var syncBattery: [(Int, Int)] = []
     private var syncSteps: [(Int, Int)] = []
     private let finder = PhoneFinder()
+    let updater = UpdateManager()
+    private var updatePSM: CBL2CAPPSM?
     private var frameID = -1
     private var frameTotal = 0
     private var frameChunks: [Int: Data] = [:]
@@ -170,6 +172,11 @@ final class HeartRateManager: NSObject, ObservableObject {
         ])
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermission()
+        updater.manager = self
+        // Vérification discrète de la dernière version à l'ouverture de l'app
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.updater.autoCheckIfNeeded()
+        }
         // La clé de restauration permet à iOS de relancer l'app en arrière-plan
         // quand la montre se reconnecte.
         central = CBCentralManager(
@@ -414,6 +421,31 @@ final class HeartRateManager: NSObject, ObservableObject {
         if let c = syncChar { p.setNotifyValue(true, for: c) }
         sendConfig()
         requestSync()
+        requestInfo()
+        updater.autoCheckIfNeeded()
+    }
+
+    // MARK: - Mise à jour de la montre
+
+    /// Prévient la montre qu'un APK de `size` octets arrive : elle ouvre un canal et annonce son numéro.
+    func beginWatchUpdate(size: Int) {
+        var bytes: [UInt8] = [0xA0]
+        bytes.append(UInt8((size >> 24) & 0xFF))
+        bytes.append(UInt8((size >> 16) & 0xFF))
+        bytes.append(UInt8((size >> 8) & 0xFF))
+        bytes.append(UInt8(size & 0xFF))
+        write(bytes)
+    }
+
+    func cancelWatchUpdate() {
+        write([0xA1])
+        updatePSM = nil
+    }
+
+    private func openUpdateChannel(psm: UInt16) {
+        guard let p = current, updater.phase == .waitingWatch, updatePSM == nil else { return }
+        updatePSM = CBL2CAPPSM(psm)
+        p.openL2CAPChannel(CBL2CAPPSM(psm))
     }
 
     // MARK: - Synchronisation des mesures prises hors connexion
@@ -791,6 +823,17 @@ extension HeartRateManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        // Le canal de mise à jour a son propre numéro
+        if let channel, let psm = updatePSM, channel.psm == psm {
+            updatePSM = nil
+            updater.channelOpened(channel)
+            return
+        }
+        if error != nil, updatePSM != nil, updater.phase == .waitingWatch {
+            updatePSM = nil
+            updater.phase = .failed("Le canal de transfert n'a pas pu s'ouvrir : \(error?.localizedDescription ?? "erreur")")
+            return
+        }
         l2capOpening = false
         if let error {
             channelError = "Canal rapide refusé : \(error.localizedDescription)"
@@ -858,10 +901,15 @@ extension HeartRateManager: CBPeripheralDelegate {
                     brightness: Int(bytes[10]),
                     dnd: bytes[11] != 0,
                     saver: bytes[12] != 0)
+            } else if kind == 0x09, bytes.count >= 3 {
+                openUpdateChannel(psm: UInt16(bytes[1]) << 8 | UInt16(bytes[2]))
+            } else if kind == 0x0A, bytes.count >= 3 {
+                updater.watchStage(Int(bytes[1]), detail: Int(bytes[2]))
             } else if kind == 0x08, bytes.count >= 3 {
                 openFrameChannel(psm: UInt16(bytes[1]) << 8 | UInt16(bytes[2]))
             } else if kind == 0x07, bytes.count >= 2 {
                 watchVersion = String(decoding: bytes[1...], as: UTF8.self)
+                updater.watchVersionChanged(watchVersion)
             } else if kind == 0x06, bytes.count >= 2 {
                 remoteState = Int(bytes[1])
                 if bytes[1] == 0 { screenImage = nil }

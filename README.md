@@ -7,6 +7,16 @@ Deux petites apps qui se parlent en Bluetooth Low Energy :
 
 Pourquoi ce choix : le profil Heart Rate est un standard Bluetooth. Pas besoin de protocole maison, et l'iPhone sait le lire nativement.
 
+## Version 0.10.0 : mises à jour depuis GitHub
+
+- Nouvel écran **Réglages > Contrôle de la montre > Mises à jour** : l'iPhone interroge GitHub (dernière « Release »), compare avec les versions installées et te prévient par notification (au plus toutes les 6 h).
+- **Mise à jour de la montre** : l'iPhone télécharge l'APK, vérifie son empreinte SHA-256 (celle publiée par GitHub), l'envoie à la montre par un canal Bluetooth rapide (L2CAP), la montre revérifie l'empreinte puis installe l'APK toute seule et relance l'app. Option « Installer seule » (désactivée par défaut) pour le faire sans rien toucher.
+- **iPhone** : iOS interdit à une app de se remplacer elle-même. L'écran propose le lien du .ipa et de la page GitHub, à ouvrir dans SideStore.
+- Pour que la montre accepte une mise à jour, l'APK doit être signé avec **la même clé** que celui installé. Les APK construits par GitHub sont désormais signés avec une clé fixe (`wear/debug-signing.jks`, publique dans le dépôt : elle sert à la continuité des mises à jour, pas à la sécurité ; la vraie protection est l'empreinte SHA-256 et le dépôt GitHub lui-même).
+- **À faire une seule fois** avec la 0.10.0 (les versions précédentes n'avaient pas la même signature) : `adb -s IP:PORT uninstall fr.nino.watchlink`, puis installer l'APK 0.10.0, redonner les autorisations, et refaire la liaison par code.
+- Autorisation d'installation, une seule fois : `adb -s IP:PORT shell appops set fr.nino.watchlink REQUEST_INSTALL_PACKAGES allow`.
+- Android peut demander une confirmation sur la montre la première fois : touche la notification « Mise à jour de WatchLink ».
+
 ## Version 0.9.1 : canal rapide
 
 - Le numéro du canal rapide est maintenant envoyé avant toute image (il était bloqué par les images), répété jusqu'à la connexion, et l'écran à distance indique « Canal rapide actif » ou « Mode lent » avec la raison en cas de refus. Retour arrière : branche `stable-v0.9.0`.

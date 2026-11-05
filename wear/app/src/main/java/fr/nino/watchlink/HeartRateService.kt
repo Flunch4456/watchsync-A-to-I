@@ -47,7 +47,14 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Base64
 import android.util.Log
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.pm.PackageInstaller
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.security.MessageDigest
 import java.io.OutputStream
 import java.time.LocalDate
 import java.util.concurrent.Executors
@@ -77,6 +84,7 @@ class HeartRateService : Service(), SensorEventListener {
         private const val CHANNEL_ID = "watchlink"
         private const val NOTIF_ID = 1
 
+        const val ACTION_INSTALL_RESULT = "fr.nino.watchlink.INSTALL_RESULT"
         const val ACTION_STOP_RING = "fr.nino.watchlink.STOP_RING"
         const val ACTION_PAIR = "fr.nino.watchlink.PAIR"
         const val ACTION_FORGET_PAIRING = "fr.nino.watchlink.FORGET_PAIRING"
@@ -137,6 +145,8 @@ class HeartRateService : Service(), SensorEventListener {
         private const val CMD_TAP = 0x91 // [0x91, x(2), y(2)] position en fraction de l'écran (0 à 65535)
         private const val CMD_SWIPE = 0x92 // [0x92, x1(2), y1(2), x2(2), y2(2), durée ms (2)]
         private const val CMD_NAV = 0x93 // [0x93, 0 retour, 1 accueil, 2 récentes, 3 notifications]
+        private const val CMD_UPDATE = 0xA0 // [0xA0, taille de l'APK sur 4 octets] prépare la réception d'une mise à jour
+        private const val CMD_UPDATE_CANCEL = 0xA1 // annule la mise à jour en cours
         private const val CMD_SYNC_REQUEST = 0x50 // [0x50, 4 octets] envoie tout ce qui est plus récent (secondes)
 
         // Événements (montre vers iPhone) : premier octet de la notification
@@ -145,6 +155,8 @@ class HeartRateService : Service(), SensorEventListener {
         private const val EVENT_INFO = 0x04 // état de la montre
         private const val EVENT_MODEL = 0x05 // nom du modèle
         private const val EVENT_VERSION = 0x07 // [0x07, version de l'app montre en texte]
+        private const val EVENT_UPDATE_PSM = 0x09 // [0x09, PSM hi, PSM lo] canal L2CAP où envoyer l'APK
+        private const val EVENT_UPDATE = 0x0A // [0x0A, étape, détail] voir updateStage()
         private const val EVENT_PSM = 0x08 // [0x08, PSM hi, PSM lo] canal rapide L2CAP pour les images
         private const val EVENT_REMOTE = 0x06 // [0x06, 0 arrêté, 1 en cours, 2 accessibilité indisponible]
         private const val EVENT_PHONE_ALERT = 0x03 // [0x03, 1 = sonner, 2 = vibrer, 0 = annuler]
@@ -277,6 +289,15 @@ class HeartRateService : Service(), SensorEventListener {
         handler.removeCallbacksAndMessages(null)
         stopRing()
         stopRemote()
+        cancelUpdate()
+        installReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "receiver: $e")
+            }
+        }
+        installReceiver = null
         endPairing()
         sensorManager.unregisterListener(this)
         try {
@@ -803,6 +824,239 @@ class HeartRateService : Service(), SensorEventListener {
                 notifyAuth(device, denied)
             }
             else -> notifyAuth(device, denied)
+        }
+    }
+
+    // --- Mise à jour de l'app reçue de l'iPhone ----------------------------------------
+    // L'iPhone télécharge l'APK sur GitHub puis l'envoie par un canal L2CAP : [empreinte SHA-256 (32 octets)][APK].
+    // Android n'installe la mise à jour que si elle porte la même signature que l'app en place.
+
+    private var updateServer: BluetoothServerSocket? = null
+    private var updateSocket: BluetoothSocket? = null
+    @Volatile private var updateConnected = false
+    @Volatile private var updateGeneration = 0
+    private var updatePsmPacket: ByteArray? = null
+    private var updateStartedAt = 0L
+    private var installReceiver: BroadcastReceiver? = null
+
+    /** Étapes : 0 annulée, 1 en attente de l'iPhone, 2 réception, 3 vérification, 4 installation, 5 confirmation à faire sur la montre, 6 échec (détail), 7 autorisation manquante. */
+    private fun updateStage(stage: Int, detail: Int = 0) {
+        status(
+            when (stage) {
+                1 -> "Mise à jour : en attente de l'iPhone"
+                2 -> "Mise à jour : réception"
+                3 -> "Mise à jour : vérification"
+                4 -> "Mise à jour : installation"
+                5 -> "Mise à jour : confirme sur la montre"
+                6 -> "Mise à jour échouée (code $detail)"
+                7 -> "Autorise les installations : adb shell appops set fr.nino.watchlink REQUEST_INSTALL_PACKAGES allow"
+                else -> "Mise à jour annulée"
+            }
+        )
+        sendEvent(byteArrayOf(EVENT_UPDATE.toByte(), stage.toByte(), detail.toByte()))
+    }
+
+    private val updatePsmRunnable: Runnable = object : Runnable {
+        override fun run() {
+            val packet = updatePsmPacket ?: return
+            if (updateConnected) return
+            if (SystemClock.elapsedRealtime() - updateStartedAt > 20_000) {
+                cancelUpdate()
+                updateStage(6, 4)
+                return
+            }
+            sendEvent(packet)
+            handler.postDelayed(this, 700)
+        }
+    }
+
+    private fun startUpdate(size: Long) {
+        cancelUpdate()
+        val free = try {
+            StatFs(cacheDir.path).availableBytes
+        } catch (e: Exception) {
+            0L
+        }
+        if (size <= 0 || size > 64L * 1024 * 1024 || free < size * 2) {
+            updateStage(6, 2)
+            return
+        }
+        try {
+            val server = btManager.adapter.listenUsingInsecureL2capChannel()
+            val psm = server.psm
+            updateServer = server
+            updateConnected = false
+            updatePsmPacket = byteArrayOf(EVENT_UPDATE_PSM.toByte(), ((psm shr 8) and 0xFF).toByte(), (psm and 0xFF).toByte())
+            updateStartedAt = SystemClock.elapsedRealtime()
+            val generation = ++updateGeneration
+            Thread { receiveUpdate(server, size, generation) }.start()
+            updateStage(1)
+            handler.postDelayed(updatePsmRunnable, 300)
+        } catch (e: Exception) {
+            Log.w(TAG, "mise à jour: $e")
+            updateStage(6, 2)
+        }
+    }
+
+    private fun cancelUpdate() {
+        updateGeneration++
+        handler.removeCallbacks(updatePsmRunnable)
+        updatePsmPacket = null
+        updateConnected = false
+        try {
+            updateSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "close update socket: $e")
+        }
+        try {
+            updateServer?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "close update server: $e")
+        }
+        updateSocket = null
+        updateServer = null
+    }
+
+    private fun readFully(input: InputStream, dst: ByteArray, count: Int) {
+        var offset = 0
+        while (offset < count) {
+            val n = input.read(dst, offset, count - offset)
+            if (n < 0) throw IOException("fin prématurée")
+            offset += n
+        }
+    }
+
+    /** Tourne sur son propre thread : attend l'iPhone, reçoit l'APK, vérifie son empreinte, puis lance l'installation. */
+    private fun receiveUpdate(server: BluetoothServerSocket, size: Long, generation: Int) {
+        var failure = 0
+        var received: File? = null
+        try {
+            val socket = server.accept()
+            if (generation != updateGeneration) {
+                socket.close()
+                return
+            }
+            updateSocket = socket
+            updateConnected = true
+            handler.post { updateStage(2) }
+            val input = socket.inputStream
+            val expected = ByteArray(32)
+            readFully(input, expected, 32)
+            val target = File(cacheDir, "update.apk")
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(16384)
+            var remaining = size
+            FileOutputStream(target).use { out ->
+                while (remaining > 0) {
+                    val n = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                    if (n < 0) throw IOException("fin prématurée")
+                    out.write(buffer, 0, n)
+                    digest.update(buffer, 0, n)
+                    remaining -= n
+                }
+                out.fd.sync()
+            }
+            handler.post { updateStage(3) }
+            val ok = MessageDigest.isEqual(digest.digest(), expected)
+            // Un octet de réponse pour l'iPhone : 1 = reçu intact, 0 = corrompu
+            socket.outputStream.write(if (ok) 1 else 0)
+            socket.outputStream.flush()
+            try {
+                Thread.sleep(400)
+            } catch (e: InterruptedException) {
+                Log.w(TAG, "attente: $e")
+            }
+            if (ok) received = target else failure = 1
+        } catch (e: Exception) {
+            Log.w(TAG, "réception de la mise à jour: $e")
+            failure = 2
+        }
+        if (generation != updateGeneration) return
+        handler.post {
+            if (generation != updateGeneration) return@post
+            val file = received
+            cancelUpdate()
+            if (failure != 0 || file == null) updateStage(6, if (failure != 0) failure else 2) else installUpdate(file)
+        }
+    }
+
+    private fun installUpdate(file: File) {
+        try {
+            if (!packageManager.canRequestPackageInstalls()) {
+                updateStage(7)
+                return
+            }
+            val installer = packageManager.packageInstaller
+            val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+            params.setAppPackageName(packageName)
+            params.setSize(file.length())
+            params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+            val sessionId = installer.createSession(params)
+            registerInstallReceiver()
+            installer.openSession(sessionId).use { session ->
+                session.openWrite("watchlink.apk", 0, file.length()).use { out ->
+                    file.inputStream().use { it.copyTo(out) }
+                    session.fsync(out)
+                }
+                val pending = PendingIntent.getBroadcast(
+                    this, sessionId,
+                    Intent(ACTION_INSTALL_RESULT).setPackage(packageName),
+                    PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                updateStage(4)
+                session.commit(pending.intentSender)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "installation: $e")
+            updateStage(6, 3)
+        }
+    }
+
+    private fun registerInstallReceiver() {
+        if (installReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val code = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)
+                if (code == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                    val confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                    if (confirm != null) askInstallConfirmation(confirm)
+                    updateStage(5)
+                } else if (code == PackageInstaller.STATUS_SUCCESS) {
+                    status("Mise à jour installée")
+                } else {
+                    // 10 + code Android : 11 échec, 12 bloquée, 13 annulée, 14 invalide, 15 conflit, 16 stockage, 17 incompatible
+                    updateStage(6, 10 + code)
+                }
+            }
+        }
+        registerReceiver(receiver, IntentFilter(ACTION_INSTALL_RESULT), Context.RECEIVER_NOT_EXPORTED)
+        installReceiver = receiver
+    }
+
+    /** Android demande une confirmation la première fois : notification à toucher, et ouverture directe si possible. */
+    private fun askInstallConfirmation(confirm: Intent) {
+        confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel("update", "Mise à jour", NotificationManager.IMPORTANCE_HIGH)
+        )
+        val open = PendingIntent.getActivity(
+            this, 7, confirm, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        nm.notify(
+            3,
+            Notification.Builder(this, "update")
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("Mise à jour de WatchLink")
+                .setContentText("Touche pour installer")
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .build()
+        )
+        try {
+            startActivity(confirm)
+        } catch (e: Exception) {
+            Log.w(TAG, "confirmation: $e")
         }
     }
 
@@ -1699,6 +1953,15 @@ class HeartRateService : Service(), SensorEventListener {
                 )
             }
             CMD_NAV -> if (value.size >= 2) RemoteAccessibilityService.instance?.navigate(value[1].toInt())
+            CMD_UPDATE -> if (value.size >= 5) {
+                var size = 0L
+                for (k in 1..4) size = (size shl 8) or (value[k].toLong() and 0xFF)
+                startUpdate(size)
+            }
+            CMD_UPDATE_CANCEL -> {
+                cancelUpdate()
+                updateStage(0)
+            }
             CMD_SYNC_REQUEST -> if (value.size >= 5) {
                 var since = 0L
                 for (k in 0 until 4) {

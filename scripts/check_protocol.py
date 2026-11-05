@@ -49,7 +49,8 @@ for n, v in events.items():
 
 # 6. Taille minimale exigée par l'iPhone <= taille réellement envoyée par la montre
 sizes = {"EVENT_STEPS": 5, "EVENT_WORN": 2, "EVENT_PHONE_ALERT": 2, "EVENT_INFO": 13,
-         "EVENT_REMOTE": 2, "EVENT_MODEL": 2, "EVENT_VERSION": 2, "EVENT_PSM": 3}
+         "EVENT_REMOTE": 2, "EVENT_MODEL": 2, "EVENT_VERSION": 2, "EVENT_PSM": 3,
+         "EVENT_UPDATE_PSM": 3, "EVENT_UPDATE": 3}
 for n, size in sizes.items():
     v = events.get(n)
     if v is None:
@@ -62,7 +63,8 @@ for n, size in sizes.items():
 # 7. Taille des commandes : ce que la montre exige <= ce que l'iPhone envoie
 cmd_sizes = {"CMD_BRIGHTNESS": 3, "CMD_TIMEOUT": 3, "CMD_DND": 2, "CMD_SAVER": 2, "CMD_REMOTE": 4,
              "CMD_TAP": 5, "CMD_SWIPE": 11, "CMD_NAV": 2, "CMD_SET_MOVE": 3, "CMD_SET_APPS": 3,
-             "CMD_SET_QUIET": 4, "CMD_SET_INTERVAL": 3, "CMD_SET_MIRROR": 2, "CMD_SYNC_REQUEST": 5}
+             "CMD_SET_QUIET": 4, "CMD_SET_INTERVAL": 3, "CMD_SET_MIRROR": 2, "CMD_SYNC_REQUEST": 5,
+             "CMD_UPDATE": 5}
 for n, size in cmd_sizes.items():
     branch = re.search(rf"{n} -> if \(value\.size >= (\d+)\)", kt)
     if branch and int(branch.group(1)) > size:
